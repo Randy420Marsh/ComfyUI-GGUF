@@ -10,7 +10,7 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def get_orig_shape(reader, tensor_name):
@@ -125,21 +125,31 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             torch_tensor = torch.from_numpy(tensor.data) # mmap
 
         shape = get_orig_shape(reader, tensor_name)
+        # fallback shape when original shape metadata is missing in GGUF
         if shape is None:
-            shape = torch.Size(tuple(int(v) for v in reversed(tensor.shape)))
+            # tensor.shape may be None in some cases -> use torch_tensor shape as fallback
+            raw_shape = tensor.shape if tensor.shape is not None else torch_tensor.shape
+            shape = torch.Size(tuple(int(v) for v in reversed(raw_shape)))
             # Workaround for stable-diffusion.cpp SDXL detection.
             if compat == "sd.cpp" and arch_str == "sdxl":
                 if any([tensor_name.endswith(x) for x in (".proj_in.weight", ".proj_out.weight")]):
                     while len(shape) > 2 and shape[-1] == 1:
                         shape = shape[:-1]
+                        
+        is_lumina_pad = (arch_str == "lumina2" and sd_key in ("x_pad_token", "cap_pad_token"))
 
+        if is_lumina_pad:
+            if len(shape) == 1:
+                shape = torch.Size((1, shape[0]))
+                
         # add to state dict
         if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
             torch_tensor = torch_tensor.view(*shape)
         state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
 
         # 1D tensors shouldn't be quantized, this is a fix for BF16
-        if len(shape) <= 1 and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+        # Force the fix to run on lumina pad tokens as well
+        if (len(shape) <= 1 or is_lumina_pad) and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
 
         # keep track of loaded tensor types
@@ -479,19 +489,19 @@ def gguf_clip_loader(path):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
-    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}:
+    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
             if arch == "llama" and sd[temb_key].shape == (131072, 5120):
                 # non-standard Comfy-Org tokenizer
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
-            elif arch == "gemma3":
+            elif arch in {"gemma3", "gemma4"}:
                 sd["spiece_model"] = gguf_gemma3_tokenizer_loader(path)
             # See note above for T5.
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
-        if arch == "gemma3":
+        if arch in {"gemma3", "gemma4"}:
             sd = sd_map_replace(sd, GEMMA3_SD_MAP)
             sd = gemma3_norm_corrections(sd)
         else:
