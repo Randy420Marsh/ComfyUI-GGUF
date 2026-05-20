@@ -145,8 +145,23 @@ class ModelLumina2(ModelTemplate):
         ("cap_embedder.1.weight", "context_refiner.0.attention.qkv.weight")
     ]
 
-arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2, 
-             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2]
+class ModelErnie(ModelTemplate):
+    # Baidu ERNIE-Image (single-stream DiT). Identifying features:
+    #   layers.{N}.adaLN_sa_ln / adaLN_mlp_ln              (per-block adaLN sublayer norms)
+    #   layers.{N}.self_attention.norm_q / norm_k          (qk-norm in self-attention)
+    #   layers.{N}.mlp.gate_proj / up_proj / linear_fc2    (gated MLP variant)
+    arch = "ernie"
+    keys_detect = [
+        (
+            "layers.0.adaLN_sa_ln.weight",
+            "layers.0.self_attention.norm_q.weight",
+            "layers.0.mlp.linear_fc2.weight",
+        ),
+    ]
+
+arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
+             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
+             ModelErnie]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
@@ -210,6 +225,118 @@ def strip_prefix(state_dict):
 
     return sd
 
+# Sibling keys ComfyUI's scaled-fp8 / per-tensor quantization format writes
+# alongside the actual `.weight` tensor. See ComfyUI/QUANTIZATION.md:
+#   <name>.weight          -> quantized storage (e.g. float8_e4m3fn)
+#   <name>.weight_scale    -> per-tensor (or per-channel) scale, applied during dequant
+#   <name>.weight_scale_2  -> optional second-level scale (double-scaling recipes)
+#   <name>.pre_quant_scale -> optional pre-smoothing scale
+#   <name>.input_scale     -> activation calibration scale (not needed once dequantized)
+#   <name>.comfy_quant     -> small int marker tensor identifying the quant layout
+SCALED_FP8_PARAM_SUFFIXES = (
+    ".weight_scale",
+    ".weight_scale_2",
+    ".pre_quant_scale",
+    ".input_scale",
+    ".comfy_quant",
+)
+SCALED_FP8_MARKER_KEYS = ("scaled_fp8",)
+FP8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e5m2")
+    if hasattr(torch, name)
+)
+
+def dequantize_scaled_fp8(state_dict):
+    """
+    Detect ComfyUI scaled-fp8 / per-tensor quantized weights in `state_dict`
+    and dequantize them back to a float dtype in place.
+
+    A weight is considered scaled-quantized when a sibling `<key>.weight_scale`
+    tensor exists. The dequantization rule (per ComfyUI/QUANTIZATION.md) is:
+
+        weight_float = weight.to(orig_dtype) * weight_scale
+
+    Per-tensor scales are 0-d; per-channel scales broadcast along dim 0 of the
+    weight (the standard convention for Linear weights of shape [out, in]).
+
+    After dequantization the sibling marker keys (`weight_scale`,
+    `weight_scale_2`, `pre_quant_scale`, `input_scale`, `comfy_quant`) and any
+    top-level `scaled_fp8` flag are removed so they don't end up in the GGUF
+    as junk tensors.
+
+    The function is a no-op for ordinary fp16/bf16/fp32 checkpoints.
+    """
+    keys_to_drop = set()
+    weight_keys_with_scale = []
+
+    for key in list(state_dict.keys()):
+        for suffix in SCALED_FP8_PARAM_SUFFIXES:
+            if key.endswith(suffix):
+                keys_to_drop.add(key)
+                if suffix == ".weight_scale":
+                    weight_keys_with_scale.append(key[: -len(suffix)] + ".weight")
+                break
+        if key in SCALED_FP8_MARKER_KEYS:
+            keys_to_drop.add(key)
+
+    if not weight_keys_with_scale and not keys_to_drop:
+        return state_dict
+
+    if weight_keys_with_scale:
+        logging.info(
+            f"Detected ComfyUI scaled-fp8 quantization on {len(weight_keys_with_scale)} "
+            f"weight(s); dequantizing before GGUF conversion."
+        )
+
+    # Pick a sensible storage dtype for the dequantized result: prefer bf16 if
+    # the rest of the model is bf16, otherwise fp16. handle_tensors() will
+    # quantize from there.
+    target_dtype = torch.bfloat16
+    for v in state_dict.values():
+        if v.dtype == torch.float16:
+            target_dtype = torch.float16
+            break
+        if v.dtype == torch.bfloat16:
+            target_dtype = torch.bfloat16
+            break
+
+    for weight_key in weight_keys_with_scale:
+        if weight_key not in state_dict:
+            logging.warning(
+                f"  weight_scale present but matching weight missing: {weight_key!r}; skipping."
+            )
+            continue
+        weight = state_dict[weight_key]
+        scale_key = weight_key[: -len(".weight")] + ".weight_scale"
+        scale = state_dict[scale_key]
+
+        # Promote both to fp32 for numerically safe multiplication; fp8 weights
+        # cannot be multiplied directly. This matches ComfyUI's runtime
+        # dequantization path (qdata.to(fp16/fp32) * scale).
+        weight_f32 = weight.to(torch.float32)
+        scale_f32 = scale.to(torch.float32)
+
+        if scale_f32.dim() == 0 or scale_f32.numel() == 1:
+            dequant = weight_f32 * scale_f32.reshape(())
+        else:
+            # Per-channel scale: broadcast along dim 0 (out_features for Linear,
+            # out_channels for Conv). Reject mismatched shapes loudly.
+            if scale_f32.numel() != weight_f32.shape[0]:
+                raise ValueError(
+                    f"weight_scale shape {tuple(scale_f32.shape)} not broadcastable "
+                    f"to weight shape {tuple(weight_f32.shape)} for {weight_key!r}"
+                )
+            broadcast_shape = (-1,) + (1,) * (weight_f32.dim() - 1)
+            dequant = weight_f32 * scale_f32.reshape(broadcast_shape)
+
+        state_dict[weight_key] = dequant.to(target_dtype)
+
+    for k in keys_to_drop:
+        state_dict.pop(k, None)
+
+    return state_dict
+
 def load_state_dict(path):
     if any(path.endswith(x) for x in [".ckpt", ".pt", ".bin", ".pth"]):
         state_dict = torch.load(path, map_location="cpu", weights_only=True)
@@ -222,6 +349,7 @@ def load_state_dict(path):
     else:
         state_dict = load_file(path)
 
+    state_dict = dequantize_scaled_fp8(state_dict)
     return strip_prefix(state_dict)
 
 def handle_tensors(writer, state_dict, model_arch):
