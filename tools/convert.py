@@ -23,6 +23,12 @@ class ModelTemplate:
     def handle_nd_tensor(self, key, data):
         raise NotImplementedError(f"Tensor detected that exceeds dims supported by C++ code! ({key} @ {data.shape})")
 
+class ModelHunyuanDiT(ModelTemplate):
+    arch = "hunyuan"
+    keys_detect = [
+        ("layers.0.mlp.gate_proj.weight", "layers.0.self_attention.to_q.weight"),
+    ]
+
 class ModelFlux(ModelTemplate):
     arch = "flux"
     keys_detect = [
@@ -145,8 +151,9 @@ class ModelLumina2(ModelTemplate):
         ("cap_embedder.1.weight", "context_refiner.0.attention.qkv.weight")
     ]
 
+# Update arch
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2, 
-             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2]
+             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2, ModelHunyuanDiT]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
