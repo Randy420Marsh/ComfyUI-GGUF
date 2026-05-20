@@ -6,6 +6,7 @@ import logging
 import argparse
 from tqdm import tqdm
 from safetensors.torch import load_file, save_file
+import numpy as np
 
 QUANTIZATION_THRESHOLD = 1024
 REARRANGE_THRESHOLD = 512
@@ -198,6 +199,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generate F16 GGUF files from single UNET")
     parser.add_argument("--src", required=True, help="Source model ckpt file.")
     parser.add_argument("--dst", help="Output unet gguf file.")
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "fp16", "bf16"],
+        default="auto",
+        help=(
+            "Force the output GGUF F16-class dtype. 'auto' (default) keeps the "
+            "source dtype as a hint (bf16-source -> BF16 GGUF, fp16-source -> F16 "
+            "GGUF). 'fp16' coerces every BF16 / fp8-dequantized weight to F16, "
+            "which is required on Turing GPUs (RTX 20xx) and earlier that lack "
+            "native bf16 support and would otherwise upcast bf16 -> fp32 at "
+            "inference time. 'bf16' is the inverse (always emit BF16)."
+        ),
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.src):
@@ -252,7 +266,7 @@ SCALED_FP8_PARAM_SUFFIXES = (
 )
 SCALED_FP8_MARKER_KEYS = ("scaled_fp8",)
 
-def dequantize_scaled_fp8(state_dict):
+def dequantize_scaled_fp8(state_dict, target_dtype=None):
     """
     Detect ComfyUI scaled-fp8 / per-tensor quantized weights in `state_dict`
     and dequantize them back to a float dtype in place.
@@ -294,17 +308,19 @@ def dequantize_scaled_fp8(state_dict):
             f"weight(s); dequantizing before GGUF conversion."
         )
 
-    # Pick a sensible storage dtype for the dequantized result: prefer bf16 if
-    # the rest of the model is bf16, otherwise fp16. handle_tensors() will
-    # requantize from there during the GGUF write.
-    target_dtype = torch.bfloat16
-    for v in state_dict.values():
-        if v.dtype == torch.float16:
-            target_dtype = torch.float16
-            break
-        if v.dtype == torch.bfloat16:
-            target_dtype = torch.bfloat16
-            break
+    # Pick a storage dtype for the dequantized result. Caller can pin it
+    # (e.g. force_dtype='fp16' for Turing/no-bf16 GPUs); otherwise infer:
+    # prefer fp16 if the rest of the model is fp16, else bf16. handle_tensors()
+    # will requantize from there during the GGUF write.
+    if target_dtype is None:
+        target_dtype = torch.bfloat16
+        for v in state_dict.values():
+            if v.dtype == torch.float16:
+                target_dtype = torch.float16
+                break
+            if v.dtype == torch.bfloat16:
+                target_dtype = torch.bfloat16
+                break
 
     for weight_key in weight_keys_with_scale:
         if weight_key not in state_dict:
@@ -342,7 +358,7 @@ def dequantize_scaled_fp8(state_dict):
 
     return state_dict
 
-def load_state_dict(path):
+def load_state_dict(path, dequant_target_dtype=None):
     if any(path.endswith(x) for x in [".ckpt", ".pt", ".bin", ".pth"]):
         state_dict = torch.load(path, map_location="cpu", weights_only=True)
         for subkey in ["model", "module"]:
@@ -354,10 +370,10 @@ def load_state_dict(path):
     else:
         state_dict = load_file(path)
 
-    state_dict = dequantize_scaled_fp8(state_dict)
+    state_dict = dequantize_scaled_fp8(state_dict, target_dtype=dequant_target_dtype)
     return strip_prefix(state_dict)
 
-def handle_tensors(writer, state_dict, model_arch):
+def handle_tensors(writer, state_dict, model_arch, force_dtype=None):
     name_lengths = tuple(sorted(
         ((key, len(key)) for key in state_dict.keys()),
         key=lambda item: item[1],
@@ -387,7 +403,13 @@ def handle_tensors(writer, state_dict, model_arch):
         n_dims = len(data.shape)
         data_shape = data.shape
         if old_dtype == torch.bfloat16:
-            data_qtype = gguf.GGMLQuantizationType.BF16
+            # force_dtype='fp16' coerces every bf16-source weight to F16 in the
+            # GGUF, for Turing / RTX 20xx targets that have no native bf16.
+            if force_dtype == "fp16":
+                data_qtype = gguf.GGMLQuantizationType.F16
+                data = data.astype(np.float16)
+            else:
+                data_qtype = gguf.GGMLQuantizationType.BF16
         # elif old_dtype == torch.float32:
         #     data_qtype = gguf.GGMLQuantizationType.F32
         else:
@@ -441,9 +463,17 @@ def handle_tensors(writer, state_dict, model_arch):
 
         writer.add_tensor(new_name, data, raw_dtype=data_qtype)
 
-def convert_file(path, dst_path=None, interact=True, overwrite=False):
+def convert_file(path, dst_path=None, interact=True, overwrite=False, dtype="auto"):
+    # Map the user-facing --dtype flag to a torch dtype for the scaled-fp8
+    # dequantization stage, then forward the same hint to handle_tensors().
+    dequant_target = None
+    if dtype == "fp16":
+        dequant_target = torch.float16
+    elif dtype == "bf16":
+        dequant_target = torch.bfloat16
+
     # load & run model detection logic
-    state_dict = load_state_dict(path)
+    state_dict = load_state_dict(path, dequant_target_dtype=dequant_target)
     model_arch = detect_arch(state_dict)
     logging.info(f"* Architecture detected from input: {model_arch.arch}")
 
@@ -452,7 +482,12 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False):
     dtypes = {x:dtypes.count(x) for x in set(dtypes)}
     main_dtype = max(dtypes, key=dtypes.get)
 
-    if main_dtype == torch.bfloat16:
+    if dtype == "fp16":
+        # User explicitly wants F16 GGUF (Turing target).
+        ftype_name = "F16"
+        ftype_gguf = gguf.LlamaFileType.MOSTLY_F16
+        logging.info("* Output dtype: F16 (forced via --dtype fp16)")
+    elif dtype == "bf16" or (dtype == "auto" and main_dtype == torch.bfloat16):
         ftype_name = "BF16"
         ftype_gguf = gguf.LlamaFileType.MOSTLY_BF16
     # elif main_dtype == torch.float32:
@@ -479,7 +514,7 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False):
     if ftype_gguf is not None:
         writer.add_file_type(ftype_gguf)
 
-    handle_tensors(writer, state_dict, model_arch)
+    handle_tensors(writer, state_dict, model_arch, force_dtype=dtype)
     writer.write_header_to_file(path=dst_path)
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
@@ -494,4 +529,4 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False):
 
 if __name__ == "__main__":
     args = parse_args()
-    convert_file(args.src, args.dst)
+    convert_file(args.src, args.dst, dtype=args.dtype)

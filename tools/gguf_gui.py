@@ -5,7 +5,8 @@ import subprocess
 from urllib.parse import unquote
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QLineEdit, QPushButton, QLabel, QFileDialog,
-                               QPlainTextEdit, QHBoxLayout, QProgressBar)
+                               QPlainTextEdit, QHBoxLayout, QProgressBar,
+                               QCheckBox)
 from PySide6.QtCore import QThread, Signal, Slot
 from gguf import GGUFReader
 
@@ -27,11 +28,12 @@ class ConversionThread(QThread):
     log_signal = Signal(str)
     finished_signal = Signal(bool, str)
 
-    def __init__(self, src, temp_dir, out_dir):
+    def __init__(self, src, temp_dir, out_dir, force_fp16=False):
         super().__init__()
         self.src = src
         self.temp_dir = temp_dir
         self.out_dir = out_dir
+        self.force_fp16 = force_fp16
 
     # ── Subprocess helper ─────────────────────────────────────────────────────
 
@@ -188,7 +190,16 @@ class ConversionThread(QThread):
 
             if not skip_convert:
                 self.log_signal.emit("\n=== Step 1: Converting to F16 GGUF ===")
-                cmd = f"python ComfyUI-GGUF/tools/convert.py --src '{src_for_convert}' --dst '{f16_tmp}'"
+                dtype_arg = " --dtype fp16" if self.force_fp16 else ""
+                if self.force_fp16:
+                    self.log_signal.emit(
+                        "  Forcing --dtype fp16 (RTX 20xx / no native bf16): "
+                        "bf16-source weights will be written as F16 in the GGUF."
+                    )
+                cmd = (
+                    f"python ComfyUI-GGUF/tools/convert.py "
+                    f"--src '{src_for_convert}' --dst '{f16_tmp}'{dtype_arg}"
+                )
                 if self._stream_command(cmd, my_env) != 0:
                     raise RuntimeError("F16 conversion failed. See log above.")
 
@@ -284,6 +295,16 @@ class MainWindow(QMainWindow):
         row.addWidget(b)
         layout.addLayout(row)
 
+        # ── Force fp16 toggle ─────────────────────────────────────────────────
+        # Turing (RTX 20xx) and earlier GPUs have no native bf16 — bf16 tensors
+        # get upcast to fp32 at inference, doubling memory and tanking throughput.
+        # Default ON because the typical user of this fork runs on a 2070S.
+        self.force_fp16_box = QCheckBox(
+            "Force F16 output (no BF16 — required for RTX 20xx / Turing)"
+        )
+        self.force_fp16_box.setChecked(True)
+        layout.addWidget(self.force_fp16_box)
+
         # ── Save preset ───────────────────────────────────────────────────────
         btn_save = QPushButton("Save Temp & Output Paths as Preset")
         btn_save.setStyleSheet("background-color: #34495e; color: white; font-weight: bold;")
@@ -368,6 +389,7 @@ class MainWindow(QMainWindow):
                 json.dump({
                     "temp": self.temp_field.text().strip(),
                     "output": self.out_field.text().strip(),
+                    "force_fp16": self.force_fp16_box.isChecked(),
                 }, f)
             self.log_area.appendPlainText("Preset saved.")
         except Exception as exc:
@@ -380,6 +402,9 @@ class MainWindow(QMainWindow):
                     data = json.load(f)
                 self.temp_field.setText(data.get("temp", "").strip())
                 self.out_field.setText(data.get("output", "").strip())
+                # Default to True so first-time users on RTX 20xx aren't bitten
+                # by the bf16-upcast issue.
+                self.force_fp16_box.setChecked(bool(data.get("force_fp16", True)))
             except Exception as exc:
                 self.log_area.appendPlainText(f"Error loading preset: {exc}")
 
@@ -401,7 +426,10 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(False)
         self.progress_bar.setRange(0, 0)   # indeterminate while running
 
-        self.worker = ConversionThread(src, temp_dir, out_dir)
+        self.worker = ConversionThread(
+            src, temp_dir, out_dir,
+            force_fp16=self.force_fp16_box.isChecked(),
+        )
         self.worker.log_signal.connect(self.update_log)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
