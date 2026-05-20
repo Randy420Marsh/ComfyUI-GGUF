@@ -369,4 +369,3 @@ def convert_file(path, dst_path=None, interact=True, overwrite=False):
 if __name__ == "__main__":
     args = parse_args()
     convert_file(args.src, args.dst)
-
