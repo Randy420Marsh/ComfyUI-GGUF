@@ -411,16 +411,26 @@ def gguf_tekken_tokenizer_loader(path, temb_shape):
 
     model_str = get_field(reader, "tokenizer.ggml.model", str)
     if model_str == "gpt2":
-        if temb_shape == (131072, 5120): # probably Mistral
+        # Mistral / Ministral tekken tokenizer vocab is always 131072.
+        # The second dim of token_embd (hidden) varies per model size
+        # (5120 for Mistral Large, 3072 for Ministral 3B) and doesn't
+        # affect the tokenizer config we synthesise below.
+        if len(temb_shape) >= 1 and int(temb_shape[0]) == 131072:
             data = {
                 "config": {"num_vocab_tokens": 150000, "default_vocab_size": 131072},
                 "vocab": [],
                 "special_tokens": [],
             }
         else:
-            raise NotImplementedError("Unknown model, can't set tokenizer!")
+            raise NotImplementedError(
+                f"Unknown Mistral/Ministral GGUF token_embd shape {tuple(temb_shape)} "
+                "(expected vocab dim 131072) -- please open an issue with the "
+                "output of `python tools/inspect_gguf.py --metadata <file>`."
+            )
     else:
-        raise NotImplementedError("Unknown model, can't set tokenizer!")
+        raise NotImplementedError(
+            f"Unknown tokenizer.ggml.model = {model_str!r}; can't reconstruct tekken tokenizer."
+        )
 
     tokens = get_list_field(reader, "tokenizer.ggml.tokens", str)
     toktypes = get_list_field(reader, "tokenizer.ggml.token_type", int)
@@ -507,7 +517,14 @@ def gguf_clip_loader(path):
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
-            if arch == "llama" and sd[temb_key].shape == (131072, 5120):
+            # Comfy-Org's Mistral tekken tokenizer is identified by its
+            # vocab dim (131072) regardless of hidden dim, so it covers
+            # both Mistral-Large (131072x5120) and Ministral-3B-Instruct
+            # (131072x3072). ERNIE-Image uses Ministral-3B as its text
+            # encoder per docs.comfy.org; without setting tekken_model
+            # here, comfy.text_encoders.flux.load_mistral_tokenizer()
+            # gets None and crashes inside json.loads(None).
+            if arch in {"llama", "mistral3"} and sd[temb_key].shape[0] == 131072:
                 # non-standard Comfy-Org tokenizer
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
             elif arch in {"gemma3", "gemma4"}:
