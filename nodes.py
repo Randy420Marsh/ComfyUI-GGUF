@@ -201,11 +201,40 @@ class CLIPLoaderGGUF:
     @classmethod
     def INPUT_TYPES(s):
         base = nodes.CLIPLoader.INPUT_TYPES()
+        file_list = s.get_filename_list()
         return {
             "required": {
-                "clip_name": (s.get_filename_list(),),
+                "clip_name": (file_list,),
                 "type": base["required"]["type"],
-            }
+            },
+            "optional": {
+                # Optional multimodal projector sidecar GGUF. Defaults to
+                # "None" so existing workflows behave identically. When
+                # set, the chosen mmproj GGUF is loaded and its tensors
+                # are merged into the text-encoder state dict, enabling
+                # vision input on the TextGenerate node for architectures
+                # whose upstream ComfyUI tokenizer accepts `image=`
+                # (currently only Gemma-4). For other archs (Mistral3 /
+                # Pixtral) the tensors are loaded but cannot yet be used
+                # by TextGenerate until upstream ComfyUI adds the
+                # matching vision tokenizer.
+                "mmproj_name": (
+                    ["None"] + file_list,
+                    {
+                        "default": "None",
+                        "tooltip": (
+                            "Optional multimodal projector (mmproj-*.gguf) "
+                            "sidecar for the text encoder. Pick this when "
+                            "filename auto-discovery doesn't find it "
+                            "(e.g. unsloth's bare `mmproj-BF16.gguf`). "
+                            "Only used downstream by TextGenerate for "
+                            "Gemma-4 today; other archs load the tensors "
+                            "but cannot use them until upstream ComfyUI "
+                            "adds the matching vision tokenizer."
+                        ),
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("CLIP",)
@@ -220,11 +249,14 @@ class CLIPLoaderGGUF:
         files += folder_paths.get_filename_list("clip_gguf")
         return sorted(files)
 
-    def load_data(self, ckpt_paths):
+    def load_data(self, ckpt_paths, mmproj_paths=None):
         clip_data = []
-        for p in ckpt_paths:
+        for i, p in enumerate(ckpt_paths):
+            mp = None
+            if mmproj_paths is not None and i < len(mmproj_paths):
+                mp = mmproj_paths[i]
             if p.endswith(".gguf"):
-                sd = gguf_clip_loader(p)
+                sd = gguf_clip_loader(p, mmproj_path=mp)
             else:
                 sd = comfy.utils.load_torch_file(p, safe_load=True)
                 if "scaled_fp8" in sd: # NOTE: Scaled FP8 would require different custom ops, but only one can be active
@@ -245,10 +277,13 @@ class CLIPLoaderGGUF:
         clip.patcher = GGUFModelPatcher.clone(clip.patcher)
         return clip
 
-    def load_clip(self, clip_name, type="stable_diffusion"):
+    def load_clip(self, clip_name, type="stable_diffusion", mmproj_name="None"):
         clip_path = folder_paths.get_full_path("clip", clip_name)
+        mmproj_path = None
+        if mmproj_name and mmproj_name != "None":
+            mmproj_path = folder_paths.get_full_path("clip", mmproj_name)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
+        return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path], [mmproj_path])),)
 
 class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
