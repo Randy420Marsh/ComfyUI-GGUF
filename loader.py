@@ -10,7 +10,7 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "ernie", "hunyuan"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "mistral3", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def get_orig_shape(reader, tensor_name):
@@ -168,7 +168,15 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     # extra info to return
     extra = {
         "arch_str": arch_str,
-        "metadata": get_gguf_metadata(reader)
+        "metadata": get_gguf_metadata(reader),
+        # Pull GQA head counts out of the per-arch namespace so downstream
+        # code (e.g. gguf_clip_loader's llama_permute call) doesn't have to
+        # hardcode them. Either or both may be None when the GGUF lacks
+        # the field -- callers must supply a fallback.
+        "n_head": (get_field(reader, f"{arch_str}.attention.head_count", int)
+                   if arch_str else None),
+        "n_head_kv": (get_field(reader, f"{arch_str}.attention.head_count_kv", int)
+                      if arch_str else None),
     }
     return (state_dict, extra)
 
@@ -480,6 +488,12 @@ def gguf_gemma3_tokenizer_loader(path):
 def gguf_clip_loader(path):
     sd, extra = gguf_sd_loader(path, is_text_model=True)
     arch = extra.get("arch_str", None)
+    # GQA head counts from the file metadata; sane fallback for any GGUF
+    # that omits them. (32, 8) matches Llama-3-8B / Mistral-7B-v0.3 /
+    # Ministral-3B-Instruct, which is the official ERNIE-Image text
+    # encoder per Comfy-Org/ERNIE-Image.
+    n_head = extra.get("n_head") or 32
+    n_head_kv = extra.get("n_head_kv") or 8
     if arch in {"t5", "t5encoder"}:
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape == (256384, 4096):
@@ -489,7 +503,7 @@ def gguf_clip_loader(path):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
-    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}:
+    elif arch in {"llama", "mistral3", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
@@ -506,8 +520,8 @@ def gguf_clip_loader(path):
             sd = gemma3_norm_corrections(sd)
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
-        if arch == "llama":
-            sd = llama_permute(sd, 32, 8) # L3 / Mistral
+        if arch in {"llama", "mistral3"}:
+            sd = llama_permute(sd, n_head, n_head_kv) # L3 / Mistral / Ministral
         if arch == "qwen2vl":
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)
