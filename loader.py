@@ -286,16 +286,23 @@ def strip_quant_suffix(name):
         name = name[:match.start()]
     return name
 
-def gguf_mmproj_loader(path):
-    # Reverse version of Qwen2VLVisionModel.modify_tensors
-    logging.info("Attenpting to find mmproj file for text encoder...")
+def _find_mmproj_sibling(path):
+    """Locate a sibling mmproj GGUF via filename convention.
 
-    # get name to match w/o quant suffix
+    Matches sibling *.gguf files containing "mmproj" whose name also
+    contains the text-encoder filename stem (with quant suffix
+    stripped). This is the Qwen2-VL-style convention used by e.g.
+    `dummy9996/Felldude-Uncensored-Ministral3-3B-mmproj-BF16.gguf`.
+
+    Returns the full path of the first match, or None. Repos that
+    publish a bare `mmproj-*.gguf` without the encoder name in it
+    (e.g. unsloth's Ministral GGUFs) will return None here -- those
+    users should pass `mmproj_name` to CLIPLoaderGGUF explicitly.
+    """
     tenc_fname = os.path.basename(path)
     tenc = os.path.splitext(tenc_fname)[0].lower()
     tenc = strip_quant_suffix(tenc)
 
-    # try and find matching mmproj
     target = []
     root = os.path.dirname(path)
     for fname in os.listdir(root):
@@ -307,16 +314,64 @@ def gguf_mmproj_loader(path):
         if tenc in name.lower():
             target.append(fname)
 
-    if len(target) == 0:
-        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Qwen-Image-Edit will be broken!")
-        return {}
+    if not target:
+        return None
     if len(target) > 1:
-        logging.error(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
+        logging.warning(
+            f"Ambiguous mmproj for text encoder '{tenc_fname}'; "
+            f"using first match: {target[0]}"
+        )
+    return os.path.join(root, target[0])
 
-    logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
-    target = os.path.join(root, target[0])
-    vsd, _ = gguf_sd_loader(target, is_text_model=True)
 
+def gguf_mmproj_loader(path, mmproj_path=None, arch=None):
+    """Load the multimodal projector (vision) sidecar GGUF.
+
+    `path` is the text-encoder GGUF (used for auto-discovery and log
+    context only). `mmproj_path`, if given, is the explicit path to
+    the mmproj GGUF and bypasses auto-discovery -- this is what the
+    CLIPLoaderGGUF `mmproj_name` input wires up. `arch` is the
+    text-encoder architecture string; arch-specific post-processing
+    runs only for arch == "qwen2vl" (the original use case).
+
+    For other archs (gemma3 / gemma4 / mistral3 / pixtral) we just
+    load the raw mmproj tensors with their original `v.*` keys and
+    let the downstream consumer decide what to do with them. That
+    is enough for tokenizers / vision encoders that read the raw
+    keys themselves; arches that need a remap+postprocess will get
+    a follow-up patch once their upstream support lands.
+    """
+    if mmproj_path is None:
+        mmproj_path = _find_mmproj_sibling(path)
+        if mmproj_path is None:
+            # Only Qwen-Image-Edit currently hard-fails without it;
+            # other archs treat the absence of mmproj as "text-only mode".
+            if arch == "qwen2vl":
+                logging.error(
+                    f"Can't find mmproj file for '{os.path.basename(path)}'! "
+                    "Qwen-Image-Edit will be broken -- pass `mmproj_name` "
+                    "to CLIPLoaderGGUF explicitly to fix."
+                )
+            return {}
+
+    if not os.path.isfile(mmproj_path):
+        logging.error(f"mmproj path does not exist: {mmproj_path}")
+        return {}
+
+    logging.info(
+        f"Loading mmproj '{os.path.basename(mmproj_path)}' for text encoder "
+        f"'{os.path.basename(path)}'."
+    )
+    vsd, _ = gguf_sd_loader(mmproj_path, is_text_model=True)
+
+    if arch != "qwen2vl":
+        # No arch-specific remap available yet for gemma / mistral3 /
+        # pixtral mmprojs -- return the raw `v.*` tensors so they are
+        # available in the state dict for downstream code that knows
+        # how to consume them.
+        return vsd
+
+    # ---- Qwen2-VL post-processing (preserved from the original loader) ----
     # concat 4D to 5D
     if "v.patch_embd.weight.1" in vsd:
         w1 = dequantize_tensor(vsd.pop("v.patch_embd.weight"), dtype=torch.float32)
@@ -495,7 +550,7 @@ def gguf_gemma3_tokenizer_loader(path):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
-def gguf_clip_loader(path):
+def gguf_clip_loader(path, mmproj_path=None):
     sd, extra = gguf_sd_loader(path, is_text_model=True)
     arch = extra.get("arch_str", None)
     # GQA head counts from the file metadata; sane fallback for any GGUF
@@ -539,8 +594,18 @@ def gguf_clip_loader(path):
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch in {"llama", "mistral3"}:
             sd = llama_permute(sd, n_head, n_head_kv) # L3 / Mistral / Ministral
-        if arch == "qwen2vl":
-            vsd = gguf_mmproj_loader(path)
+        # mmproj loading: explicit `mmproj_path` wins for any arch;
+        # filename-based auto-discovery only runs for Qwen2-VL where
+        # `Qwen-Image-Edit` requires the vision tower to be present.
+        # For other archs the explicit picker on CLIPLoaderGGUF is the
+        # supported path -- see _find_mmproj_sibling docstring for why
+        # auto-discovery alone is insufficient (bare `mmproj-*.gguf`
+        # naming in unsloth's Ministral / other repos).
+        if mmproj_path is not None:
+            vsd = gguf_mmproj_loader(path, mmproj_path=mmproj_path, arch=arch)
+            sd.update(vsd)
+        elif arch == "qwen2vl":
+            vsd = gguf_mmproj_loader(path, arch="qwen2vl")
             sd.update(vsd)
     else:
         pass
