@@ -12,6 +12,54 @@ from gguf import GGUFReader
 
 CONFIG_FILE = "settings.json"
 
+# Output GGUF types supported by llama-quantize at the tag `tools/lcpp.patch`
+# targets (b3962). Each entry is (name, description) — the description is
+# verbatim from quantize.cpp:quant_options at that tag. Order chosen to
+# match the upstream CLI help so the GUI mirrors what `llama-quantize`
+# itself shows.
+LLAMA_QUANTIZE_TYPES = [
+    ("Q4_0",     "4.34G, +0.4685 ppl @ Llama-3-8B"),
+    ("Q4_1",     "4.78G, +0.4511 ppl @ Llama-3-8B"),
+    ("Q5_0",     "5.21G, +0.1316 ppl @ Llama-3-8B"),
+    ("Q5_1",     "5.65G, +0.1062 ppl @ Llama-3-8B"),
+    ("IQ2_XXS",  "2.06 bpw quantization"),
+    ("IQ2_XS",   "2.31 bpw quantization"),
+    ("IQ2_S",    "2.5  bpw quantization"),
+    ("IQ2_M",    "2.7  bpw quantization"),
+    ("IQ1_S",    "1.56 bpw quantization"),
+    ("IQ1_M",    "1.75 bpw quantization"),
+    ("TQ1_0",    "1.69 bpw ternarization"),
+    ("TQ2_0",    "2.06 bpw ternarization"),
+    ("Q2_K",     "2.96G, +3.5199 ppl @ Llama-3-8B"),
+    ("Q2_K_S",   "2.96G, +3.1836 ppl @ Llama-3-8B"),
+    ("IQ3_XXS",  "3.06 bpw quantization"),
+    ("IQ3_S",    "3.44 bpw quantization"),
+    ("IQ3_M",    "3.66 bpw quantization mix"),
+    ("Q3_K",     "alias for Q3_K_M"),
+    ("IQ3_XS",   "3.3 bpw quantization"),
+    ("Q3_K_S",   "3.41G, +1.6321 ppl @ Llama-3-8B"),
+    ("Q3_K_M",   "3.74G, +0.6569 ppl @ Llama-3-8B"),
+    ("Q3_K_L",   "4.03G, +0.5562 ppl @ Llama-3-8B"),
+    ("IQ4_NL",   "4.50 bpw non-linear quantization"),
+    ("IQ4_XS",   "4.25 bpw non-linear quantization"),
+    ("Q4_K",     "alias for Q4_K_M"),
+    ("Q4_K_S",   "4.37G, +0.2689 ppl @ Llama-3-8B"),
+    ("Q4_K_M",   "4.58G, +0.1754 ppl @ Llama-3-8B  (recommended default for 8 GB VRAM)"),
+    ("Q5_K",     "alias for Q5_K_M"),
+    ("Q5_K_S",   "5.21G, +0.1049 ppl @ Llama-3-8B"),
+    ("Q5_K_M",   "5.33G, +0.0569 ppl @ Llama-3-8B  (sweet spot if it fits)"),
+    ("Q6_K",     "6.14G, +0.0217 ppl @ Llama-3-8B"),
+    ("Q8_0",     "7.96G, +0.0026 ppl @ Llama-3-8B  (~8 bpw; rarely fits on 8 GB)"),
+    ("Q4_0_4_4", "4.34G, ARM-only repack of Q4_0 (do not use on x86 GPUs)"),
+    ("Q4_0_4_8", "4.34G, ARM-only repack of Q4_0 (do not use on x86 GPUs)"),
+    ("Q4_0_8_8", "4.34G, ARM-only repack of Q4_0 (do not use on x86 GPUs)"),
+    ("F16",      "~14 G; no quantization, half-precision storage"),
+    ("BF16",     "~14 G; no quantization, bf16 storage (Ampere+ only at runtime)"),
+    ("F32",      "~28 G; no quantization, full float32 (debugging only)"),
+    ("COPY",     "copy tensors verbatim, no quantization (debugging)"),
+]
+DEFAULT_QUANT_TYPE = "Q4_K_M"
+
 # Minimum NVIDIA compute capability for native BF16 tensor-core support.
 # Ampere = 8.0 (A100), 8.6 (RTX 30xx), 8.9 (Ada/RTX 40xx), 9.0 (Hopper/H100),
 # 10.x (Blackwell/RTX 50xx, B100). Turing (CC 7.5, e.g. RTX 20xx) and earlier
@@ -110,7 +158,8 @@ class ConversionThread(QThread):
     finished_signal = Signal(bool, str)
 
     def __init__(self, src, temp_dir, out_dir,
-                 dtype_cli="auto", dtype_reason=""):
+                 dtype_cli="auto", dtype_reason="",
+                 quant_type=DEFAULT_QUANT_TYPE):
         super().__init__()
         self.src = src
         self.temp_dir = temp_dir
@@ -120,6 +169,9 @@ class ConversionThread(QThread):
         # (convert.py preserves the source dtype).
         self.dtype_cli = dtype_cli
         self.dtype_reason = dtype_reason
+        # Output quantization name passed verbatim as the third positional
+        # arg to llama-quantize; e.g. 'Q4_K_M', 'Q8_0', 'F16'.
+        self.quant_type = quant_type
 
     # ── Subprocess helper ─────────────────────────────────────────────────────
 
@@ -240,7 +292,7 @@ class ConversionThread(QThread):
         fixed_tmp = os.path.join(self.temp_dir, filename + "_f16_fixed.gguf")
         final_out = os.path.join(
             self.out_dir,
-            filename.replace(".safetensors", "_Q4_K_M.gguf"),
+            filename.replace(".safetensors", f"_{self.quant_type}.gguf"),
         )
 
         try:
@@ -295,9 +347,14 @@ class ConversionThread(QThread):
             if self._stream_command(cmd, my_env) != 0:
                 raise RuntimeError("fix_pad.py failed. See log above.")
 
-            # ── Step 3: Quantize to Q4_K_M ───────────────────────────────
-            self.log_signal.emit("\n=== Step 3: Quantizing to Q4_K_M ===")
-            cmd = f"./llama.cpp/build/bin/llama-quantize '{fixed_tmp}' '{final_out}' Q4_K_M"
+            # ── Step 3: Quantize to user-selected type ────────────────────
+            self.log_signal.emit(
+                f"\n=== Step 3: Quantizing to {self.quant_type} ==="
+            )
+            cmd = (
+                f"./llama.cpp/build/bin/llama-quantize "
+                f"'{fixed_tmp}' '{final_out}' {self.quant_type}"
+            )
             if self._stream_command(cmd, my_env) != 0:
                 raise RuntimeError(
                     "llama-quantize failed.\n\n"
@@ -401,6 +458,28 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.dtype_status)
 
+        # ── llama-quantize output type ────────────────────────────────────────
+        # Drives the third positional arg passed to llama-quantize in Step 3.
+        # Default is Q4_K_M, which fits comfortably on 8 GB VRAM for 6-12B
+        # image-diffusion models. The full upstream list is exposed so users
+        # can pick smaller (IQ*, Q2_K, Q3_K_*) or larger (Q5/Q6/Q8) quants
+        # depending on their VRAM budget.
+        layout.addWidget(QLabel("Quantization type:"))
+        self.quant_combo = QComboBox()
+        for name, _desc in LLAMA_QUANTIZE_TYPES:
+            self.quant_combo.addItem(name, name)
+        self.quant_combo.setCurrentIndex(
+            self.quant_combo.findData(DEFAULT_QUANT_TYPE)
+        )
+        self.quant_combo.currentIndexChanged.connect(self._refresh_quant_status)
+        layout.addWidget(self.quant_combo)
+        self.quant_status = QLabel()
+        self.quant_status.setWordWrap(True)
+        self.quant_status.setStyleSheet(
+            "color: #95a5a6; font-style: italic; padding-left: 4px;"
+        )
+        layout.addWidget(self.quant_status)
+
         # ── Save preset ───────────────────────────────────────────────────────
         btn_save = QPushButton("Save Temp & Output Paths as Preset")
         btn_save.setStyleSheet("background-color: #34495e; color: white; font-weight: bold;")
@@ -434,6 +513,7 @@ class MainWindow(QMainWindow):
 
         self.load_preset()
         self._refresh_dtype_status()
+        self._refresh_quant_status()
 
     # ── File browsers ─────────────────────────────────────────────────────────
 
@@ -487,6 +567,7 @@ class MainWindow(QMainWindow):
                     "temp": self.temp_field.text().strip(),
                     "output": self.out_field.text().strip(),
                     "dtype_mode": self.dtype_combo.currentData(),
+                    "quant_type": self.quant_combo.currentData(),
                 }, f)
             self.log_area.appendPlainText("Preset saved.")
         except Exception as exc:
@@ -506,6 +587,10 @@ class MainWindow(QMainWindow):
                 idx = self.dtype_combo.findData(mode)
                 if idx >= 0:
                     self.dtype_combo.setCurrentIndex(idx)
+                quant_type = data.get("quant_type", DEFAULT_QUANT_TYPE)
+                qidx = self.quant_combo.findData(quant_type)
+                if qidx >= 0:
+                    self.quant_combo.setCurrentIndex(qidx)
             except Exception as exc:
                 self.log_area.appendPlainText(f"Error loading preset: {exc}")
 
@@ -543,6 +628,15 @@ class MainWindow(QMainWindow):
                 "Override: --dtype bf16 (invalid on Turing / pre-Ampere GPUs)."
             )
 
+    def _refresh_quant_status(self):
+        """Show the upstream llama-quantize description for the selected
+        type, so the user can see the rough size + perplexity tradeoff in
+        the UI without consulting quantize.cpp.
+        """
+        name = self.quant_combo.currentData()
+        desc = next((d for n, d in LLAMA_QUANTIZE_TYPES if n == name), "")
+        self.quant_status.setText(f"{name}: {desc}")
+
     # ── Workflow ──────────────────────────────────────────────────────────────
 
     def start_workflow(self):
@@ -578,6 +672,7 @@ class MainWindow(QMainWindow):
         self.worker = ConversionThread(
             src, temp_dir, out_dir,
             dtype_cli=dtype_cli, dtype_reason=dtype_reason,
+            quant_type=self.quant_combo.currentData(),
         )
         self.worker.log_signal.connect(self.update_log)
         self.worker.finished_signal.connect(self.on_finished)
