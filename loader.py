@@ -495,6 +495,55 @@ def gguf_gemma3_tokenizer_loader(path):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
+def gguf_gemma4_tokenizer_loader(path):
+    """Load Gemma-4's HuggingFace tokenizer.json sidecar.
+
+    Gemma-4 uses the HuggingFace `tokenizers` library (BPE-style
+    `tokenizer.json`), not SentencePiece, so the existing
+    `gguf_gemma3_tokenizer_loader` does not produce the right shape
+    for it. Upstream `comfy.text_encoders.gemma4.Gemma4SDTokenizer`
+    reads `tokenizer_data["tokenizer_json"]` and passes it through
+    `tokenizers.Tokenizer.from_str(...)`.
+
+    llama.cpp's `convert_hf_to_gguf.py` does not embed the full
+    `tokenizer.json` blob into the GGUF (it writes the SPM-style
+    `tokenizer.ggml.*` fields instead), so we cannot reliably
+    reconstruct it from metadata alone. Instead we look for a
+    sidecar `tokenizer.json` next to the GGUF -- this is the file
+    that ships in every official Gemma HF repo (e.g.
+    `google/gemma-3-12b-it/tokenizer.json`) and that the user already
+    has on disk if they converted the model themselves.
+
+    Returns a `torch.uint8` tensor of the raw JSON bytes on success,
+    or None if no sidecar is found. The caller should leave the
+    state-dict key unset when None is returned so that the upstream
+    error message stays informative.
+    """
+    base_dir = os.path.dirname(path)
+    candidates = [
+        os.path.join(base_dir, "tokenizer.json"),
+        os.path.join(base_dir, "gemma4-tokenizer.json"),
+        os.path.join(base_dir, "gemma-tokenizer.json"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            with open(c, "rb") as f:
+                blob = f.read()
+            logging.info(
+                f"Loaded Gemma-4 tokenizer.json sidecar from {os.path.basename(c)} "
+                f"({len(blob)} bytes)."
+            )
+            # frombuffer needs a writable buffer; copy via bytearray.
+            return torch.frombuffer(bytearray(blob), dtype=torch.uint8)
+    logging.error(
+        f"Gemma-4 tokenizer.json sidecar not found next to "
+        f"'{os.path.basename(path)}'. ComfyUI's Gemma4SDTokenizer requires "
+        f"this file -- download `tokenizer.json` from the original "
+        f"HuggingFace repo (e.g. https://huggingface.co/google/gemma-3-12b-it "
+        f"or the Gemma-4 source repo for your model) and place it in '{base_dir}'."
+    )
+    return None
+
 def gguf_clip_loader(path):
     sd, extra = gguf_sd_loader(path, is_text_model=True)
     arch = extra.get("arch_str", None)
@@ -527,8 +576,24 @@ def gguf_clip_loader(path):
             if arch in {"llama", "mistral3"} and sd[temb_key].shape[0] == 131072:
                 # non-standard Comfy-Org tokenizer
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
-            elif arch in {"gemma3", "gemma4"}:
+            elif arch == "gemma3":
+                # Gemma-3 uses a SentencePiece tokenizer; the synthesised
+                # spiece_model blob below is the format that upstream
+                # `comfy.text_encoders.lt.Gemma3_12BTokenizer` expects.
                 sd["spiece_model"] = gguf_gemma3_tokenizer_loader(path)
+            elif arch == "gemma4":
+                # Gemma-4 uses the HuggingFace `tokenizers` library and
+                # reads `tokenizer_data["tokenizer_json"]` upstream, so
+                # the SentencePiece reconstruction above is not the
+                # right shape. We look for a `tokenizer.json` sidecar
+                # next to the GGUF; if it's missing, the loader leaves
+                # `tokenizer_json` unset and the user gets a clear log
+                # line telling them where to download it from. See
+                # docstring on `gguf_gemma4_tokenizer_loader` for why
+                # reconstruction from GGUF metadata isn't viable.
+                tj = gguf_gemma4_tokenizer_loader(path)
+                if tj is not None:
+                    sd["tokenizer_json"] = tj
             # See note above for T5.
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
