@@ -6,11 +6,140 @@ from urllib.parse import unquote
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QLineEdit, QPushButton, QLabel, QFileDialog,
                                QPlainTextEdit, QHBoxLayout, QProgressBar,
-                               QCheckBox)
+                               QComboBox)
 from PySide6.QtCore import QThread, Signal, Slot
 from gguf import GGUFReader
 
 CONFIG_FILE = "settings.json"
+
+# Output GGUF types supported by llama-quantize at the tag `tools/lcpp.patch`
+# targets (b3962). Each entry is (name, description) — the description is
+# verbatim from quantize.cpp:quant_options at that tag. Order chosen to
+# match the upstream CLI help so the GUI mirrors what `llama-quantize`
+# itself shows.
+LLAMA_QUANTIZE_TYPES = [
+    ("Q4_0",     "4.34G, +0.4685 ppl @ Llama-3-8B"),
+    ("Q4_1",     "4.78G, +0.4511 ppl @ Llama-3-8B"),
+    ("Q5_0",     "5.21G, +0.1316 ppl @ Llama-3-8B"),
+    ("Q5_1",     "5.65G, +0.1062 ppl @ Llama-3-8B"),
+    ("IQ2_XXS",  "2.06 bpw quantization"),
+    ("IQ2_XS",   "2.31 bpw quantization"),
+    ("IQ2_S",    "2.5  bpw quantization"),
+    ("IQ2_M",    "2.7  bpw quantization"),
+    ("IQ1_S",    "1.56 bpw quantization"),
+    ("IQ1_M",    "1.75 bpw quantization"),
+    ("TQ1_0",    "1.69 bpw ternarization"),
+    ("TQ2_0",    "2.06 bpw ternarization"),
+    ("Q2_K",     "2.96G, +3.5199 ppl @ Llama-3-8B"),
+    ("Q2_K_S",   "2.96G, +3.1836 ppl @ Llama-3-8B"),
+    ("IQ3_XXS",  "3.06 bpw quantization"),
+    ("IQ3_S",    "3.44 bpw quantization"),
+    ("IQ3_M",    "3.66 bpw quantization mix"),
+    ("Q3_K",     "alias for Q3_K_M"),
+    ("IQ3_XS",   "3.3 bpw quantization"),
+    ("Q3_K_S",   "3.41G, +1.6321 ppl @ Llama-3-8B"),
+    ("Q3_K_M",   "3.74G, +0.6569 ppl @ Llama-3-8B"),
+    ("Q3_K_L",   "4.03G, +0.5562 ppl @ Llama-3-8B"),
+    ("IQ4_NL",   "4.50 bpw non-linear quantization"),
+    ("IQ4_XS",   "4.25 bpw non-linear quantization"),
+    ("Q4_K",     "alias for Q4_K_M"),
+    ("Q4_K_S",   "4.37G, +0.2689 ppl @ Llama-3-8B"),
+    ("Q4_K_M",   "4.58G, +0.1754 ppl @ Llama-3-8B  (recommended default for 8 GB VRAM)"),
+    ("Q5_K",     "alias for Q5_K_M"),
+    ("Q5_K_S",   "5.21G, +0.1049 ppl @ Llama-3-8B"),
+    ("Q5_K_M",   "5.33G, +0.0569 ppl @ Llama-3-8B  (sweet spot if it fits)"),
+    ("Q6_K",     "6.14G, +0.0217 ppl @ Llama-3-8B"),
+    ("Q8_0",     "7.96G, +0.0026 ppl @ Llama-3-8B  (~8 bpw; rarely fits on 8 GB)"),
+    ("Q4_0_4_4", "4.34G, ARM-only repack of Q4_0 (do not use on x86 GPUs)"),
+    ("Q4_0_4_8", "4.34G, ARM-only repack of Q4_0 (do not use on x86 GPUs)"),
+    ("Q4_0_8_8", "4.34G, ARM-only repack of Q4_0 (do not use on x86 GPUs)"),
+    ("F16",      "~14 G; no quantization, half-precision storage"),
+    ("BF16",     "~14 G; no quantization, bf16 storage (Ampere+ only at runtime)"),
+    ("F32",      "~28 G; no quantization, full float32 (debugging only)"),
+    ("COPY",     "copy tensors verbatim, no quantization (debugging)"),
+]
+DEFAULT_QUANT_TYPE = "Q4_K_M"
+
+# Minimum NVIDIA compute capability for native BF16 tensor-core support.
+# Ampere = 8.0 (A100), 8.6 (RTX 30xx), 8.9 (Ada/RTX 40xx), 9.0 (Hopper/H100),
+# 10.x (Blackwell/RTX 50xx, B100). Turing (CC 7.5, e.g. RTX 20xx) and earlier
+# have no native BF16 — BF16 tensors are upcast to fp32 at inference.
+BF16_MIN_COMPUTE_CAP = 8.0
+
+
+def detect_nvidia_gpu():
+    """Probe nvidia-smi for GPU name + compute capability.
+
+    Returns (gpu_name, compute_capability_str) for the *lowest*-CC GPU on
+    the system (because the model has to be runnable on whichever GPU the
+    user picks). Returns (None, None) if nvidia-smi is unavailable, fails,
+    or reports no GPUs (CPU-only / ROCm / Apple Silicon).
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,compute_cap",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None, None
+    if proc.returncode != 0:
+        return None, None
+
+    lowest_cc = None
+    lowest_name = None
+    lowest_cc_str = None
+    for line in proc.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        name, cc_str = parts[0], parts[1]
+        try:
+            cc = float(cc_str)
+        except ValueError:
+            continue
+        if lowest_cc is None or cc < lowest_cc:
+            lowest_cc = cc
+            lowest_name = name
+            # Preserve the original 'X.Y' string from nvidia-smi rather than
+            # reformatting; '9.0' is more meaningful than '9' to the user.
+            lowest_cc_str = cc_str
+
+    if lowest_name is None:
+        return None, None
+    return lowest_name, lowest_cc_str
+
+
+def resolve_auto_dtype():
+    """Decide the --dtype value to pass to convert.py when the GUI is in
+    'Auto' mode. Returns (cli_arg, human_readable_reason).
+
+      * BF16-capable HW (CC >= 8.0): 'auto' (let convert.py preserve source)
+      * Pre-Ampere HW (CC < 8.0):    'fp16' (force all weights to F16)
+      * nvidia-smi missing:          'fp16' (safe default, works everywhere)
+    """
+    name, cc_str = detect_nvidia_gpu()
+    if name is None:
+        return (
+            "fp16",
+            "Auto: nvidia-smi unavailable -> using --dtype fp16 (safe default).",
+        )
+    cc = float(cc_str)
+    if cc >= BF16_MIN_COMPUTE_CAP:
+        return (
+            "auto",
+            f"Auto: detected {name} (CC {cc_str}) -> --dtype auto "
+            f"(BF16 supported; source dtype preserved).",
+        )
+    return (
+        "fp16",
+        f"Auto: detected {name} (CC {cc_str}) -> --dtype fp16 "
+        f"(no native BF16; BF16-source weights will be cast to F16).",
+    )
+
 
 # fix_5d_tensors_{arch}.safetensors files that convert.py may leave behind.
 # If they exist on a second run, ModelHyVid.handle_nd_tensor raises RuntimeError.
@@ -28,12 +157,21 @@ class ConversionThread(QThread):
     log_signal = Signal(str)
     finished_signal = Signal(bool, str)
 
-    def __init__(self, src, temp_dir, out_dir, force_fp16=False):
+    def __init__(self, src, temp_dir, out_dir,
+                 dtype_cli="auto", dtype_reason="",
+                 quant_type=DEFAULT_QUANT_TYPE):
         super().__init__()
         self.src = src
         self.temp_dir = temp_dir
         self.out_dir = out_dir
-        self.force_fp16 = force_fp16
+        # dtype_cli is one of 'auto' / 'fp16' / 'bf16' and maps directly to
+        # convert.py's --dtype flag. 'auto' is the default and is a no-op
+        # (convert.py preserves the source dtype).
+        self.dtype_cli = dtype_cli
+        self.dtype_reason = dtype_reason
+        # Output quantization name passed verbatim as the third positional
+        # arg to llama-quantize; e.g. 'Q4_K_M', 'Q8_0', 'F16'.
+        self.quant_type = quant_type
 
     # ── Subprocess helper ─────────────────────────────────────────────────────
 
@@ -154,7 +292,7 @@ class ConversionThread(QThread):
         fixed_tmp = os.path.join(self.temp_dir, filename + "_f16_fixed.gguf")
         final_out = os.path.join(
             self.out_dir,
-            filename.replace(".safetensors", "_Q4_K_M.gguf"),
+            filename.replace(".safetensors", f"_{self.quant_type}.gguf"),
         )
 
         try:
@@ -190,12 +328,12 @@ class ConversionThread(QThread):
 
             if not skip_convert:
                 self.log_signal.emit("\n=== Step 1: Converting to F16 GGUF ===")
-                dtype_arg = " --dtype fp16" if self.force_fp16 else ""
-                if self.force_fp16:
-                    self.log_signal.emit(
-                        "  Forcing --dtype fp16 (RTX 20xx / no native bf16): "
-                        "bf16-source weights will be written as F16 in the GGUF."
-                    )
+                if self.dtype_reason:
+                    self.log_signal.emit(f"  {self.dtype_reason}")
+                dtype_arg = (
+                    "" if self.dtype_cli == "auto"
+                    else f" --dtype {self.dtype_cli}"
+                )
                 cmd = (
                     f"python ComfyUI-GGUF/tools/convert.py "
                     f"--src '{src_for_convert}' --dst '{f16_tmp}'{dtype_arg}"
@@ -209,9 +347,14 @@ class ConversionThread(QThread):
             if self._stream_command(cmd, my_env) != 0:
                 raise RuntimeError("fix_pad.py failed. See log above.")
 
-            # ── Step 3: Quantize to Q4_K_M ───────────────────────────────
-            self.log_signal.emit("\n=== Step 3: Quantizing to Q4_K_M ===")
-            cmd = f"./llama.cpp/build/bin/llama-quantize '{fixed_tmp}' '{final_out}' Q4_K_M"
+            # ── Step 3: Quantize to user-selected type ────────────────────
+            self.log_signal.emit(
+                f"\n=== Step 3: Quantizing to {self.quant_type} ==="
+            )
+            cmd = (
+                f"./llama.cpp/build/bin/llama-quantize "
+                f"'{fixed_tmp}' '{final_out}' {self.quant_type}"
+            )
             if self._stream_command(cmd, my_env) != 0:
                 raise RuntimeError(
                     "llama-quantize failed.\n\n"
@@ -295,15 +438,47 @@ class MainWindow(QMainWindow):
         row.addWidget(b)
         layout.addLayout(row)
 
-        # ── Force fp16 toggle ─────────────────────────────────────────────────
-        # Turing (RTX 20xx) and earlier GPUs have no native bf16 — bf16 tensors
-        # get upcast to fp32 at inference, doubling memory and tanking throughput.
-        # Default ON because the typical user of this fork runs on a 2070S.
-        self.force_fp16_box = QCheckBox(
-            "Force F16 output (no BF16 — required for RTX 20xx / Turing)"
+        # ── Output dtype selector ─────────────────────────────────────────────
+        # 'Auto' probes nvidia-smi at startup and uses --dtype fp16 on Turing
+        # (CC < 8.0) or pre-Ampere HW. 'Force F16' / 'Force BF16' are manual
+        # overrides for debugging or for users who know the target HW better
+        # than the probe does.
+        self._detected_gpu, self._detected_cc = detect_nvidia_gpu()
+        layout.addWidget(QLabel("Output dtype:"))
+        self.dtype_combo = QComboBox()
+        self.dtype_combo.addItem("Auto (detect via nvidia-smi)", "auto")
+        self.dtype_combo.addItem("Force F16 (debug / Turing-compatible)", "fp16")
+        self.dtype_combo.addItem("Force BF16 (debug / Ampere+ only)", "bf16")
+        self.dtype_combo.currentIndexChanged.connect(self._refresh_dtype_status)
+        layout.addWidget(self.dtype_combo)
+        self.dtype_status = QLabel()
+        self.dtype_status.setWordWrap(True)
+        self.dtype_status.setStyleSheet(
+            "color: #95a5a6; font-style: italic; padding-left: 4px;"
         )
-        self.force_fp16_box.setChecked(True)
-        layout.addWidget(self.force_fp16_box)
+        layout.addWidget(self.dtype_status)
+
+        # ── llama-quantize output type ────────────────────────────────────────
+        # Drives the third positional arg passed to llama-quantize in Step 3.
+        # Default is Q4_K_M, which fits comfortably on 8 GB VRAM for 6-12B
+        # image-diffusion models. The full upstream list is exposed so users
+        # can pick smaller (IQ*, Q2_K, Q3_K_*) or larger (Q5/Q6/Q8) quants
+        # depending on their VRAM budget.
+        layout.addWidget(QLabel("Quantization type:"))
+        self.quant_combo = QComboBox()
+        for name, _desc in LLAMA_QUANTIZE_TYPES:
+            self.quant_combo.addItem(name, name)
+        self.quant_combo.setCurrentIndex(
+            self.quant_combo.findData(DEFAULT_QUANT_TYPE)
+        )
+        self.quant_combo.currentIndexChanged.connect(self._refresh_quant_status)
+        layout.addWidget(self.quant_combo)
+        self.quant_status = QLabel()
+        self.quant_status.setWordWrap(True)
+        self.quant_status.setStyleSheet(
+            "color: #95a5a6; font-style: italic; padding-left: 4px;"
+        )
+        layout.addWidget(self.quant_status)
 
         # ── Save preset ───────────────────────────────────────────────────────
         btn_save = QPushButton("Save Temp & Output Paths as Preset")
@@ -337,6 +512,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_area)
 
         self.load_preset()
+        self._refresh_dtype_status()
+        self._refresh_quant_status()
 
     # ── File browsers ─────────────────────────────────────────────────────────
 
@@ -389,7 +566,8 @@ class MainWindow(QMainWindow):
                 json.dump({
                     "temp": self.temp_field.text().strip(),
                     "output": self.out_field.text().strip(),
-                    "force_fp16": self.force_fp16_box.isChecked(),
+                    "dtype_mode": self.dtype_combo.currentData(),
+                    "quant_type": self.quant_combo.currentData(),
                 }, f)
             self.log_area.appendPlainText("Preset saved.")
         except Exception as exc:
@@ -402,11 +580,62 @@ class MainWindow(QMainWindow):
                     data = json.load(f)
                 self.temp_field.setText(data.get("temp", "").strip())
                 self.out_field.setText(data.get("output", "").strip())
-                # Default to True so first-time users on RTX 20xx aren't bitten
-                # by the bf16-upcast issue.
-                self.force_fp16_box.setChecked(bool(data.get("force_fp16", True)))
+                mode = data.get("dtype_mode")
+                if mode is None:
+                    # Backward-compat with PR #2's settings.json schema.
+                    mode = "fp16" if data.get("force_fp16", True) else "auto"
+                idx = self.dtype_combo.findData(mode)
+                if idx >= 0:
+                    self.dtype_combo.setCurrentIndex(idx)
+                quant_type = data.get("quant_type", DEFAULT_QUANT_TYPE)
+                qidx = self.quant_combo.findData(quant_type)
+                if qidx >= 0:
+                    self.quant_combo.setCurrentIndex(qidx)
             except Exception as exc:
                 self.log_area.appendPlainText(f"Error loading preset: {exc}")
+
+    # ── dtype status label ────────────────────────────────────────────────────
+
+    def _refresh_dtype_status(self):
+        """Update the small italic status label below the dtype combo so the
+        user can see exactly which --dtype value will be passed to convert.py.
+        """
+        mode = self.dtype_combo.currentData()
+        if mode == "auto":
+            if self._detected_gpu is None:
+                self.dtype_status.setText(
+                    "nvidia-smi not available -> Auto resolves to --dtype fp16 "
+                    "(safe default for CPU / ROCm / Apple Silicon)."
+                )
+            else:
+                cc = float(self._detected_cc)
+                if cc >= BF16_MIN_COMPUTE_CAP:
+                    self.dtype_status.setText(
+                        f"Detected: {self._detected_gpu} (CC {self._detected_cc})"
+                        f" -> --dtype auto (BF16 supported)."
+                    )
+                else:
+                    self.dtype_status.setText(
+                        f"Detected: {self._detected_gpu} (CC {self._detected_cc})"
+                        f" -> --dtype fp16 (no native BF16 support)."
+                    )
+        elif mode == "fp16":
+            self.dtype_status.setText(
+                "Override: --dtype fp16 (every BF16-source weight is cast to F16)."
+            )
+        else:  # 'bf16'
+            self.dtype_status.setText(
+                "Override: --dtype bf16 (invalid on Turing / pre-Ampere GPUs)."
+            )
+
+    def _refresh_quant_status(self):
+        """Show the upstream llama-quantize description for the selected
+        type, so the user can see the rough size + perplexity tradeoff in
+        the UI without consulting quantize.cpp.
+        """
+        name = self.quant_combo.currentData()
+        desc = next((d for n, d in LLAMA_QUANTIZE_TYPES if n == name), "")
+        self.quant_status.setText(f"{name}: {desc}")
 
     # ── Workflow ──────────────────────────────────────────────────────────────
 
@@ -426,9 +655,24 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(False)
         self.progress_bar.setRange(0, 0)   # indeterminate while running
 
+        mode = self.dtype_combo.currentData()
+        if mode == "auto":
+            dtype_cli, dtype_reason = resolve_auto_dtype()
+        elif mode == "fp16":
+            dtype_cli, dtype_reason = (
+                "fp16",
+                "Override: forcing --dtype fp16 (all BF16-source weights cast to F16).",
+            )
+        else:  # 'bf16'
+            dtype_cli, dtype_reason = (
+                "bf16",
+                "Override: forcing --dtype bf16 (only valid on Ampere or newer).",
+            )
+
         self.worker = ConversionThread(
             src, temp_dir, out_dir,
-            force_fp16=self.force_fp16_box.isChecked(),
+            dtype_cli=dtype_cli, dtype_reason=dtype_reason,
+            quant_type=self.quant_combo.currentData(),
         )
         self.worker.log_signal.connect(self.update_log)
         self.worker.finished_signal.connect(self.on_finished)
