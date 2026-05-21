@@ -6,11 +6,92 @@ from urllib.parse import unquote
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QLineEdit, QPushButton, QLabel, QFileDialog,
                                QPlainTextEdit, QHBoxLayout, QProgressBar,
-                               QCheckBox)
+                               QComboBox)
 from PySide6.QtCore import QThread, Signal, Slot
 from gguf import GGUFReader
 
 CONFIG_FILE = "settings.json"
+
+# Minimum NVIDIA compute capability for native BF16 tensor-core support.
+# Ampere = 8.0 (A100), 8.6 (RTX 30xx), 8.9 (Ada/RTX 40xx), 9.0 (Hopper/H100),
+# 10.x (Blackwell/RTX 50xx, B100). Turing (CC 7.5, e.g. RTX 20xx) and earlier
+# have no native BF16 — BF16 tensors are upcast to fp32 at inference.
+BF16_MIN_COMPUTE_CAP = 8.0
+
+
+def detect_nvidia_gpu():
+    """Probe nvidia-smi for GPU name + compute capability.
+
+    Returns (gpu_name, compute_capability_str) for the *lowest*-CC GPU on
+    the system (because the model has to be runnable on whichever GPU the
+    user picks). Returns (None, None) if nvidia-smi is unavailable, fails,
+    or reports no GPUs (CPU-only / ROCm / Apple Silicon).
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,compute_cap",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None, None
+    if proc.returncode != 0:
+        return None, None
+
+    lowest_cc = None
+    lowest_name = None
+    lowest_cc_str = None
+    for line in proc.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        name, cc_str = parts[0], parts[1]
+        try:
+            cc = float(cc_str)
+        except ValueError:
+            continue
+        if lowest_cc is None or cc < lowest_cc:
+            lowest_cc = cc
+            lowest_name = name
+            # Preserve the original 'X.Y' string from nvidia-smi rather than
+            # reformatting; '9.0' is more meaningful than '9' to the user.
+            lowest_cc_str = cc_str
+
+    if lowest_name is None:
+        return None, None
+    return lowest_name, lowest_cc_str
+
+
+def resolve_auto_dtype():
+    """Decide the --dtype value to pass to convert.py when the GUI is in
+    'Auto' mode. Returns (cli_arg, human_readable_reason).
+
+      * BF16-capable HW (CC >= 8.0): 'auto' (let convert.py preserve source)
+      * Pre-Ampere HW (CC < 8.0):    'fp16' (force all weights to F16)
+      * nvidia-smi missing:          'fp16' (safe default, works everywhere)
+    """
+    name, cc_str = detect_nvidia_gpu()
+    if name is None:
+        return (
+            "fp16",
+            "Auto: nvidia-smi unavailable -> using --dtype fp16 (safe default).",
+        )
+    cc = float(cc_str)
+    if cc >= BF16_MIN_COMPUTE_CAP:
+        return (
+            "auto",
+            f"Auto: detected {name} (CC {cc_str}) -> --dtype auto "
+            f"(BF16 supported; source dtype preserved).",
+        )
+    return (
+        "fp16",
+        f"Auto: detected {name} (CC {cc_str}) -> --dtype fp16 "
+        f"(no native BF16; BF16-source weights will be cast to F16).",
+    )
+
 
 # fix_5d_tensors_{arch}.safetensors files that convert.py may leave behind.
 # If they exist on a second run, ModelHyVid.handle_nd_tensor raises RuntimeError.
@@ -28,12 +109,17 @@ class ConversionThread(QThread):
     log_signal = Signal(str)
     finished_signal = Signal(bool, str)
 
-    def __init__(self, src, temp_dir, out_dir, force_fp16=False):
+    def __init__(self, src, temp_dir, out_dir,
+                 dtype_cli="auto", dtype_reason=""):
         super().__init__()
         self.src = src
         self.temp_dir = temp_dir
         self.out_dir = out_dir
-        self.force_fp16 = force_fp16
+        # dtype_cli is one of 'auto' / 'fp16' / 'bf16' and maps directly to
+        # convert.py's --dtype flag. 'auto' is the default and is a no-op
+        # (convert.py preserves the source dtype).
+        self.dtype_cli = dtype_cli
+        self.dtype_reason = dtype_reason
 
     # ── Subprocess helper ─────────────────────────────────────────────────────
 
@@ -190,12 +276,12 @@ class ConversionThread(QThread):
 
             if not skip_convert:
                 self.log_signal.emit("\n=== Step 1: Converting to F16 GGUF ===")
-                dtype_arg = " --dtype fp16" if self.force_fp16 else ""
-                if self.force_fp16:
-                    self.log_signal.emit(
-                        "  Forcing --dtype fp16 (RTX 20xx / no native bf16): "
-                        "bf16-source weights will be written as F16 in the GGUF."
-                    )
+                if self.dtype_reason:
+                    self.log_signal.emit(f"  {self.dtype_reason}")
+                dtype_arg = (
+                    "" if self.dtype_cli == "auto"
+                    else f" --dtype {self.dtype_cli}"
+                )
                 cmd = (
                     f"python ComfyUI-GGUF/tools/convert.py "
                     f"--src '{src_for_convert}' --dst '{f16_tmp}'{dtype_arg}"
@@ -295,15 +381,25 @@ class MainWindow(QMainWindow):
         row.addWidget(b)
         layout.addLayout(row)
 
-        # ── Force fp16 toggle ─────────────────────────────────────────────────
-        # Turing (RTX 20xx) and earlier GPUs have no native bf16 — bf16 tensors
-        # get upcast to fp32 at inference, doubling memory and tanking throughput.
-        # Default ON because the typical user of this fork runs on a 2070S.
-        self.force_fp16_box = QCheckBox(
-            "Force F16 output (no BF16 — required for RTX 20xx / Turing)"
+        # ── Output dtype selector ─────────────────────────────────────────────
+        # 'Auto' probes nvidia-smi at startup and uses --dtype fp16 on Turing
+        # (CC < 8.0) or pre-Ampere HW. 'Force F16' / 'Force BF16' are manual
+        # overrides for debugging or for users who know the target HW better
+        # than the probe does.
+        self._detected_gpu, self._detected_cc = detect_nvidia_gpu()
+        layout.addWidget(QLabel("Output dtype:"))
+        self.dtype_combo = QComboBox()
+        self.dtype_combo.addItem("Auto (detect via nvidia-smi)", "auto")
+        self.dtype_combo.addItem("Force F16 (debug / Turing-compatible)", "fp16")
+        self.dtype_combo.addItem("Force BF16 (debug / Ampere+ only)", "bf16")
+        self.dtype_combo.currentIndexChanged.connect(self._refresh_dtype_status)
+        layout.addWidget(self.dtype_combo)
+        self.dtype_status = QLabel()
+        self.dtype_status.setWordWrap(True)
+        self.dtype_status.setStyleSheet(
+            "color: #95a5a6; font-style: italic; padding-left: 4px;"
         )
-        self.force_fp16_box.setChecked(True)
-        layout.addWidget(self.force_fp16_box)
+        layout.addWidget(self.dtype_status)
 
         # ── Save preset ───────────────────────────────────────────────────────
         btn_save = QPushButton("Save Temp & Output Paths as Preset")
@@ -337,6 +433,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_area)
 
         self.load_preset()
+        self._refresh_dtype_status()
 
     # ── File browsers ─────────────────────────────────────────────────────────
 
@@ -389,7 +486,7 @@ class MainWindow(QMainWindow):
                 json.dump({
                     "temp": self.temp_field.text().strip(),
                     "output": self.out_field.text().strip(),
-                    "force_fp16": self.force_fp16_box.isChecked(),
+                    "dtype_mode": self.dtype_combo.currentData(),
                 }, f)
             self.log_area.appendPlainText("Preset saved.")
         except Exception as exc:
@@ -402,11 +499,49 @@ class MainWindow(QMainWindow):
                     data = json.load(f)
                 self.temp_field.setText(data.get("temp", "").strip())
                 self.out_field.setText(data.get("output", "").strip())
-                # Default to True so first-time users on RTX 20xx aren't bitten
-                # by the bf16-upcast issue.
-                self.force_fp16_box.setChecked(bool(data.get("force_fp16", True)))
+                mode = data.get("dtype_mode")
+                if mode is None:
+                    # Backward-compat with PR #2's settings.json schema.
+                    mode = "fp16" if data.get("force_fp16", True) else "auto"
+                idx = self.dtype_combo.findData(mode)
+                if idx >= 0:
+                    self.dtype_combo.setCurrentIndex(idx)
             except Exception as exc:
                 self.log_area.appendPlainText(f"Error loading preset: {exc}")
+
+    # ── dtype status label ────────────────────────────────────────────────────
+
+    def _refresh_dtype_status(self):
+        """Update the small italic status label below the dtype combo so the
+        user can see exactly which --dtype value will be passed to convert.py.
+        """
+        mode = self.dtype_combo.currentData()
+        if mode == "auto":
+            if self._detected_gpu is None:
+                self.dtype_status.setText(
+                    "nvidia-smi not available -> Auto resolves to --dtype fp16 "
+                    "(safe default for CPU / ROCm / Apple Silicon)."
+                )
+            else:
+                cc = float(self._detected_cc)
+                if cc >= BF16_MIN_COMPUTE_CAP:
+                    self.dtype_status.setText(
+                        f"Detected: {self._detected_gpu} (CC {self._detected_cc})"
+                        f" -> --dtype auto (BF16 supported)."
+                    )
+                else:
+                    self.dtype_status.setText(
+                        f"Detected: {self._detected_gpu} (CC {self._detected_cc})"
+                        f" -> --dtype fp16 (no native BF16 support)."
+                    )
+        elif mode == "fp16":
+            self.dtype_status.setText(
+                "Override: --dtype fp16 (every BF16-source weight is cast to F16)."
+            )
+        else:  # 'bf16'
+            self.dtype_status.setText(
+                "Override: --dtype bf16 (invalid on Turing / pre-Ampere GPUs)."
+            )
 
     # ── Workflow ──────────────────────────────────────────────────────────────
 
@@ -426,9 +561,23 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(False)
         self.progress_bar.setRange(0, 0)   # indeterminate while running
 
+        mode = self.dtype_combo.currentData()
+        if mode == "auto":
+            dtype_cli, dtype_reason = resolve_auto_dtype()
+        elif mode == "fp16":
+            dtype_cli, dtype_reason = (
+                "fp16",
+                "Override: forcing --dtype fp16 (all BF16-source weights cast to F16).",
+            )
+        else:  # 'bf16'
+            dtype_cli, dtype_reason = (
+                "bf16",
+                "Override: forcing --dtype bf16 (only valid on Ampere or newer).",
+            )
+
         self.worker = ConversionThread(
             src, temp_dir, out_dir,
-            force_fp16=self.force_fp16_box.isChecked(),
+            dtype_cli=dtype_cli, dtype_reason=dtype_reason,
         )
         self.worker.log_signal.connect(self.update_log)
         self.worker.finished_signal.connect(self.on_finished)
