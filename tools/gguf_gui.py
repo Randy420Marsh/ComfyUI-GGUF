@@ -2,13 +2,23 @@ import sys
 import json
 import os
 import subprocess
+import traceback
 from urllib.parse import unquote
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QLineEdit, QPushButton, QLabel, QFileDialog,
                                QPlainTextEdit, QHBoxLayout, QProgressBar,
-                               QComboBox)
-from PySide6.QtCore import QThread, Signal, Slot
+                               QComboBox, QDialog, QDialogButtonBox,
+                               QTableWidget, QTableWidgetItem, QHeaderView,
+                               QTextEdit, QMessageBox)
+from PySide6.QtCore import QThread, Signal, Slot, Qt
+from PySide6.QtGui import QColor, QFont
 from gguf import GGUFReader
+
+# analyze_model lives in the same tools/ directory; import it directly
+# rather than via tools.* so the GUI script remains runnable as a
+# top-level `python tools/gguf_gui.py` from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import analyze_model
 
 CONFIG_FILE = "settings.json"
 
@@ -111,6 +121,43 @@ def detect_nvidia_gpu():
     if lowest_name is None:
         return None, None
     return lowest_name, lowest_cc_str
+
+
+def detect_nvidia_vram_gb():
+    """Return the smallest VRAM (in GB) across all visible NVIDIA GPUs.
+
+    Used by the Analyze button to decide which quant fits. Returns None
+    when nvidia-smi is unavailable -- analysis still runs in that case,
+    it just won't fill in the 'fits' / recommendation columns.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+
+    smallest = None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            # nvidia-smi reports memory.total in MiB.
+            mib = float(line)
+        except ValueError:
+            continue
+        gb = mib / 1024.0
+        if smallest is None or gb < smallest:
+            smallest = gb
+    return smallest
 
 
 def resolve_auto_dtype():
@@ -416,6 +463,13 @@ class MainWindow(QMainWindow):
         b = QPushButton("Browse")
         b.clicked.connect(self.browse_src)
         row.addWidget(b)
+        self.analyze_btn = QPushButton("Analyze")
+        self.analyze_btn.setToolTip(
+            "Read the safetensors header and recommend a quant type for "
+            "the detected GPU. No weights are loaded; runs in seconds."
+        )
+        self.analyze_btn.clicked.connect(self.start_analyze)
+        row.addWidget(self.analyze_btn)
         layout.addLayout(row)
 
         # ── Temp dir ──────────────────────────────────────────────────────────
@@ -444,6 +498,7 @@ class MainWindow(QMainWindow):
         # overrides for debugging or for users who know the target HW better
         # than the probe does.
         self._detected_gpu, self._detected_cc = detect_nvidia_gpu()
+        self._detected_vram_gb = detect_nvidia_vram_gb()
         layout.addWidget(QLabel("Output dtype:"))
         self.dtype_combo = QComboBox()
         self.dtype_combo.addItem("Auto (detect via nvidia-smi)", "auto")
@@ -692,6 +747,246 @@ class MainWindow(QMainWindow):
         self.log_area.appendPlainText(msg)
         sb = self.log_area.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    # -- Analyze ---------------------------------------------------------
+
+    def start_analyze(self):
+        """Run analyze_model.analyze() against the currently-selected
+        .safetensors path on a worker thread, then pop the result dialog.
+        """
+        src = self.input_field.text().strip()
+        if not src:
+            QMessageBox.warning(
+                self, "Analyze",
+                "Pick a .safetensors file first (Browse or drag-and-drop).",
+            )
+            return
+        if not os.path.isfile(src):
+            QMessageBox.warning(
+                self, "Analyze", f"File not found:\n  {src}",
+            )
+            return
+
+        self.analyze_btn.setEnabled(False)
+        self.analyze_btn.setText("Analyzing...")
+
+        self.analyze_worker = AnalyzeWorker(
+            src,
+            gpu_vram_gb=self._detected_vram_gb,
+            gpu_name=self._detected_gpu,
+        )
+        self.analyze_worker.finished_signal.connect(self.on_analyze_finished)
+        self.analyze_worker.start()
+
+    @Slot(object, str)
+    def on_analyze_finished(self, result, error):
+        self.analyze_btn.setEnabled(True)
+        self.analyze_btn.setText("Analyze")
+        if error:
+            QMessageBox.critical(self, "Analyze failed", error)
+            return
+        dlg = AnalyzeResultDialog(result, self)
+        dlg.quant_chosen.connect(self.apply_quant_recommendation)
+        dlg.exec()
+
+    @Slot(str)
+    def apply_quant_recommendation(self, quant_name):
+        """Wire the dialog's 'Use this quant' button to the main combo so
+        the user doesn't have to re-pick the type after closing Analyze.
+        """
+        idx = self.quant_combo.findData(quant_name)
+        if idx >= 0:
+            self.quant_combo.setCurrentIndex(idx)
+            self.log_area.appendPlainText(
+                f"Quant type set to {quant_name} from Analyze recommendation."
+            )
+
+
+# -- Analyze worker + dialog --------------------------------------------
+
+class AnalyzeWorker(QThread):
+    """Off-main-thread wrapper around analyze_model.analyze() so the UI
+    doesn't freeze while the safetensors header is parsed. The header
+    read itself is ~milliseconds, but architecture detection on a model
+    with thousands of keys can take noticeable time.
+    """
+    finished_signal = Signal(object, str)   # (AnalysisResult or None, error str)
+
+    def __init__(self, path, gpu_vram_gb, gpu_name):
+        super().__init__()
+        self.path = path
+        self.gpu_vram_gb = gpu_vram_gb
+        self.gpu_name = gpu_name
+
+    def run(self):
+        try:
+            result = analyze_model.analyze(
+                self.path,
+                gpu_vram_gb=self.gpu_vram_gb,
+                gpu_name=self.gpu_name,
+            )
+            self.finished_signal.emit(result, "")
+        except Exception:
+            self.finished_signal.emit(None, traceback.format_exc())
+
+
+class AnalyzeResultDialog(QDialog):
+    """Modal-ish dialog that renders an analyze_model.AnalysisResult.
+
+    Layout (top to bottom):
+      * Header: file path, params, arch, hidden dim, GPU/VRAM.
+      * Recommendation banner (highlighted) + 'Use this quant' button.
+      * Quant table (one row per quant, columns per resolution).
+      * Notes (only if analyze surfaced any).
+      * Formula box (always visible, read-only).
+    """
+    quant_chosen = Signal(str)
+
+    def __init__(self, result, parent=None):
+        super().__init__(parent)
+        self.result = result
+        self.setWindowTitle("Model Analysis")
+        self.resize(900, 600)
+        layout = QVBoxLayout(self)
+
+        # Header
+        arch_str = result.arch or "unknown"
+        klass = result.arch_class_name or "-"
+        head_text = (
+            f"<b>File:</b> {os.path.basename(result.path)} "
+            f"({analyze_model.fmt_bytes(result.file_size)})<br>"
+            f"<b>Arch:</b> {arch_str} ({klass})"
+            + ("  &mdash; <i>INVALID variant</i>" if result.invalid else "")
+            + f"<br><b>Params:</b> {analyze_model.fmt_params(result.n_params)} "
+            f"across {result.n_tensors} tensors<br>"
+            f"<b>hidden_dim:</b> {result.dims.hidden_dim or '?'} &nbsp; "
+            f"<b>num_layers:</b> {result.dims.num_layers or '?'} &nbsp; "
+            f"<b>patch_size:</b> {result.dims.patch_size or '?'} &nbsp; "
+            f"<b>in_channels:</b> {result.dims.in_channels or '?'}<br>"
+        )
+        if result.gpu_vram_gb is not None:
+            head_text += (
+                f"<b>GPU:</b> {result.gpu_name or '?'} "
+                f"({result.gpu_vram_gb:.1f} GB) &nbsp; "
+                f"<b>headroom:</b> {result.headroom_gb:.1f} GB &nbsp; "
+                f"<b>overhead:</b> {result.comfyui_overhead_mb} MB"
+            )
+        else:
+            head_text += (
+                "<i>GPU not detected (nvidia-smi unavailable) -- fits/recommendation "
+                "columns disabled.</i>"
+            )
+        header = QLabel(head_text)
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        # Recommendation banner
+        rec_row = QHBoxLayout()
+        if result.recommended:
+            rec_label = QLabel(
+                f"<b>Recommended quant:</b> {result.recommended}  "
+                f"(highest-quality option that fits with {result.headroom_gb:.0f} GB headroom "
+                f"at the largest configured resolution)"
+            )
+            rec_label.setStyleSheet(
+                "background-color: #27ae60; color: white; "
+                "padding: 8px; border-radius: 4px;"
+            )
+            use_btn = QPushButton(f"Use {result.recommended}")
+            use_btn.clicked.connect(lambda: self._emit_chosen(result.recommended))
+        else:
+            why = (
+                "no GPU detected (run on a machine with nvidia-smi or pass --vram)."
+                if result.gpu_vram_gb is None
+                else "every modelled quant exceeds the budget; lower the resolution or free VRAM."
+            )
+            rec_label = QLabel(f"<b>No recommendation</b> -- {why}")
+            rec_label.setStyleSheet(
+                "background-color: #c0392b; color: white; "
+                "padding: 8px; border-radius: 4px;"
+            )
+            use_btn = None
+        rec_label.setWordWrap(True)
+        rec_row.addWidget(rec_label, stretch=1)
+        if use_btn is not None:
+            rec_row.addWidget(use_btn)
+        layout.addLayout(rec_row)
+
+        # Results table
+        headers = ["Quant", "Weight"]
+        for label, _, _ in result.resolutions:
+            headers += [f"Act@{label}", f"Total@{label}", f"Fits@{label}"]
+        table = QTableWidget(len(result.rows), len(headers), self)
+        table.setHorizontalHeaderLabels(headers)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        table.horizontalHeader().setToolTip(
+            "Weight: per-tensor weight cost after applying convert.py's "
+            "keep-F32 rules + ggml bpw table.\n"
+            "Act: SDPA / flash-attention activation peak at the listed "
+            "PIXEL resolution (VAE 8x downsample applied).\n"
+            "Total = Weight + Act + 400 MB ComfyUI overhead.\n"
+            "Fits = Total <= (VRAM - 1 GB headroom)."
+        )
+
+        for r, row in enumerate(result.rows):
+            items = [QTableWidgetItem(row.name),
+                     QTableWidgetItem(analyze_model.fmt_bytes(row.weight_bytes))]
+            for label, _, _ in result.resolutions:
+                items.append(QTableWidgetItem(
+                    analyze_model.fmt_bytes(row.activations_bytes[label])))
+                items.append(QTableWidgetItem(
+                    analyze_model.fmt_bytes(row.total_bytes[label])))
+                fit_item = QTableWidgetItem(
+                    "YES" if row.fits[label]
+                    else ("-" if result.gpu_vram_gb is None else "no")
+                )
+                if row.fits[label]:
+                    fit_item.setForeground(QColor("#27ae60"))
+                elif result.gpu_vram_gb is not None:
+                    fit_item.setForeground(QColor("#c0392b"))
+                items.append(fit_item)
+            if result.recommended == row.name:
+                font = QFont()
+                font.setBold(True)
+                for it in items:
+                    it.setFont(font)
+                    it.setBackground(QColor("#1e8449"))
+                    it.setForeground(QColor("white"))
+            for c, it in enumerate(items):
+                table.setItem(r, c, it)
+        layout.addWidget(table, stretch=1)
+
+        # Notes (only if any)
+        if result.notes:
+            notes_label = QLabel("<b>Notes:</b>")
+            layout.addWidget(notes_label)
+            notes_text = QTextEdit()
+            notes_text.setReadOnly(True)
+            notes_text.setMaximumHeight(80)
+            notes_text.setPlainText("\n".join("* " + n for n in result.notes))
+            layout.addWidget(notes_text)
+
+        # Formula (auditable)
+        layout.addWidget(QLabel("<b>Formula (auditable; 100% model-derived):</b>"))
+        formula = QTextEdit()
+        formula.setReadOnly(True)
+        formula.setMaximumHeight(110)
+        formula.setStyleSheet("font-family: monospace;")
+        formula.setPlainText(result.activation_formula)
+        layout.addWidget(formula)
+
+        # Close
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        bb.accepted.connect(self.accept)
+        layout.addWidget(bb)
+
+    def _emit_chosen(self, quant_name):
+        self.quant_chosen.emit(quant_name)
+        self.accept()
 
 
 if __name__ == "__main__":
