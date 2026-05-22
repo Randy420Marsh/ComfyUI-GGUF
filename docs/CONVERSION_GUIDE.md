@@ -28,7 +28,7 @@ with `gguf`, `safetensors`, `torch`, `numpy`, `tqdm`, and optionally
 6. [Phase E — Load in ComfyUI](#phase-e--load-in-comfyui)
 7. [Per-model recipes](#per-model-recipes)
    - [Flux dev / Flux schnell](#flux-dev--flux-schnell)
-   - [Z-Image Turbo / Lumina2 / RedCraft ZiB](#z-image-turbo--lumina2--redcraft-zib)
+   - [Z-Image (Turbo, 0.36, Lumina2, RedCraft ZiB)](#z-image-turbo--036--lumina2--redcraft-zib)
    - [ERNIE-Image (+ Ministral-3-3B text encoder)](#ernie-image--ministral-3-3b-text-encoder)
    - [SD3 / SD3.5](#sd3--sd35)
    - [Hunyuan Video / Wan 2.1](#hunyuan-video--wan-21)
@@ -111,7 +111,7 @@ If the script warns about **5D tensors**, that's expected for Hunyuan Video / Wa
 
 Two models in particular need a post-convert / pre-quantize fix-up step:
 
-- **Z-Image Turbo / Lumina2 / RedCraft ZiB** → run `fix_pad.py` between Phase A and Phase C. Skipping this step makes `llama-quantize` either fail outright or produce a model whose outputs are pure noise.
+- **Z-Image (Turbo / 0.36 / Lumina2 / RedCraft ZiB)** → run `fix_pad.py` between Phase A and Phase C. Skipping this step makes `llama-quantize` either fail outright (1-D pad-token case) or produce a model whose outputs are pure noise. From this revision onward `fix_pad.py` is a fast no-op (straight file copy) on checkpoints whose pad tokens are already 2-D — e.g. Z-Image 0.36 non-Turbo from [`OmegaShred/Z-Image-0.36`](https://huggingface.co/OmegaShred/Z-Image-0.36) — and the GUI skips Phase B entirely in that case.
 - **Hunyuan Video / Wan 2.1** → no Phase B step; the fix-up (`fix_5d_tensors.py`) happens after Phase C.
 
 For everything else (Flux, ERNIE-Image, SD3/3.5, SDXL extracted UNET, Hunyuan-DiT, etc.) — no Phase B step.
@@ -119,10 +119,14 @@ For everything else (Flux, ERNIE-Image, SD3/3.5, SDXL extracted UNET, Hunyuan-Di
 ```bash
 # Z-Image / Lumina2 only
 python tools/fix_pad.py /path/to/zimage-F16.gguf
-# -> writes /path/to/zimage-F16_fixed.gguf
+# 1-D pad token case (Z-Image Turbo legacy):
+#   -> writes /path/to/zimage-F16_fixed.gguf with the reshape applied
+# Pad tokens already 2-D (Z-Image 0.36 non-Turbo, etc):
+#   -> copies the source file to /path/to/zimage-F16_fixed.gguf unchanged
+#      and prints "No 1-D pad tokens found -- nothing to fix."
 ```
 
-The GUI does this automatically when it detects the arch is `lumina2`.
+The GUI does this automatically when it detects the arch is `lumina2`, and skips the rewrite entirely (and the Phase B disk I/O) when no 1-D pad tokens are present.
 
 ---
 
@@ -236,18 +240,20 @@ python tools/inspect_gguf.py /path/to/flux1-dev-Q4_K_M.gguf
 
 Sizing on an 8 GB 2070S: Flux is ~12B params; `Q4_K_M` is the realistic ceiling (~6.5 GB). `Q5_K_M` (~7.8 GB) won't fit alongside activations.
 
-### Z-Image Turbo / Lumina2 / RedCraft ZiB
+### Z-Image (Turbo / 0.36 / Lumina2 / RedCraft ZiB)
 
-**Must run `fix_pad.py` between Phase A and Phase C.** Skipping it makes `llama-quantize` either crash or produce a model that generates pure noise.
+All Z-Image checkpoints — Turbo, the 0.36 non-Turbo release ([`OmegaShred/Z-Image-0.36`](https://huggingface.co/OmegaShred/Z-Image-0.36) → `z_image_0.36.0.dev0-fp16.safetensors`, etc.), Lumina2 base models, and RedCraft ZiB distillations — share the same Lumina2 architecture (453 tensors, `cap_embedder` + `context_refiner` + `noise_refiner` block layout). `tools/convert.py` auto-detects the architecture via `ModelLumina2`; no flag needed.
+
+**Phase B (`fix_pad.py`) is required for older checkpoints where `x_pad_token` / `cap_pad_token` are stored 1-dimensionally, and a fast no-op on newer checkpoints (e.g. Z-Image 0.36) where they're already `[1, dim]`.** Skip-detection happens automatically — `fix_pad.py` prints `No 1-D pad tokens found -- nothing to fix.` and just copies the file. The GUI skips Phase B entirely in that case.
 
 ```bash
 # Phase A
 python tools/convert.py \
-  --src /path/to/redcraftFeb1126Latest_zibDistilledDX3Lucis-full.safetensors \
+  --src /path/to/z_image_0.36.0.dev0-fp16.safetensors \
   --dst /path/to/zimage_f16.gguf \
   --dtype fp16
 
-# Phase B (REQUIRED for this arch)
+# Phase B (still safe to run for newer checkpoints — it'll fast-copy)
 python tools/fix_pad.py /path/to/zimage_f16.gguf
 # -> /path/to/zimage_f16_fixed.gguf
 
@@ -258,7 +264,9 @@ python tools/fix_pad.py /path/to/zimage_f16.gguf
   Q4_K_M
 ```
 
-The GUI does Phase B automatically when it detects arch = `lumina2`.
+The GUI does Phase B automatically when it detects arch = `lumina2`, and skips it when no 1-D pad tokens are present.
+
+**If `llama-quantize` crashes with `basic_ios::clear: iostream error`** mid-tensor (e.g. `[ 13/ 453] context_refiner.0.feed_forward.w3.weight ... size = 0.000 MB` followed by the error), the F16 GGUF has a corrupt zero-byte tensor entry. Run `tools/inspect_gguf.py --check-sizes <file>` to confirm which tensor(s) are zero-byte and re-run Phase A from scratch on a known-good source drive.
 
 **Inference settings for Z-Image / S3-DiT distilled:**
 
@@ -442,6 +450,22 @@ Same — pull latest `main`. The tekken tokenizer reconstruction is now keyed on
 ### `safetensors_rust.SafetensorError: Error while deserializing header: header too large`
 
 You pointed a safetensors reader at a `.gguf` file. They are completely different on-disk formats — the safetensors loader reads the first 8 bytes as a JSON header length, gets a huge bogus number from the GGUF magic, and bails. Use `python tools/inspect_gguf.py --metadata <file>` instead.
+
+### `llama_model_quantize: failed to quantize: basic_ios::clear: iostream error`
+
+The quantizer hit a tensor with a zero declared byte count and tripped the `failbit` exception on `std::ofstream` (`fout.exceptions(std::ofstream::failbit)` in our patched `src/llama.cpp`). Look at the line *immediately before* the error in the log — it'll have the form `[NNN/MMM] tensor.name - [ ... ], type = f16, size = 0.000 MB` for a tensor that should be tens or hundreds of MiB.
+
+Diagnose with:
+
+```bash
+python tools/inspect_gguf.py --check-sizes /path/to/model_f16.gguf
+python tools/inspect_gguf.py --check-sizes /path/to/model_f16_fixed.gguf
+```
+
+`--check-sizes` walks every tensor and flags any whose stored byte count is zero or doesn't match `prod(shape) * dtype-size`. Once you know which file is corrupt, re-run that step:
+
+- **Corrupt `_f16.gguf`** → `convert.py` wrote a bad entry. Re-run Phase A. If it reproduces, your source drive is failing — copy `model.safetensors` to a different disk before re-converting.
+- **Corrupt `_f16_fixed.gguf`** → `fix_pad.py`'s round-trip introduced the corruption. Starting from this revision `fix_pad.py` is a fast no-op file-copy on checkpoints whose pad tokens are already 2-D (e.g. Z-Image 0.36 non-Turbo), which avoids the round-trip entirely. Pull latest `main` and re-run Phase B.
 
 ### `error while loading shared libraries: libggml.so: cannot open shared object file`
 

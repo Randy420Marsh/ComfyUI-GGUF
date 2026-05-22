@@ -381,6 +381,26 @@ class ConversionThread(QThread):
 
     # ── Main pipeline ─────────────────────────────────────────────────────────
 
+    def _needs_pad_fix(self, f16_path):
+        """Return True iff the F16 GGUF at ``f16_path`` has a 1-D
+        ``x_pad_token`` or ``cap_pad_token``. For all other models
+        ``fix_pad.py`` is a no-op and we skip it to avoid an expensive
+        and occasionally lossy round-trip through GGUFReader/Writer.
+        """
+        try:
+            reader = GGUFReader(f16_path, "r")
+            for t in reader.tensors:
+                if t.name in ("x_pad_token", "cap_pad_token") and len(t.shape) == 1:
+                    return True
+            return False
+        except Exception as exc:
+            # Be safe: if we can't read the file, let fix_pad try.
+            self.log_signal.emit(
+                f"  (could not inspect {f16_path} for pad tokens: {exc}; "
+                f"running fix_pad as a precaution)"
+            )
+            return True
+
     def run(self):
         filename = os.path.basename(self.src)
 
@@ -457,13 +477,29 @@ class ConversionThread(QThread):
                     raise RuntimeError("F16 conversion failed. See log above.")
 
             # ── Step 2: Padding shape fix ─────────────────────────────────
+            # The fix only does anything for Z-Image / Lumina2 models whose
+            # ``x_pad_token`` / ``cap_pad_token`` arrived as 1-D tensors.
+            # Newer Z-Image checkpoints (e.g. Z-Image 0.36 non-Turbo) already
+            # ship them as ``[1, dim]`` -- we skip the rewrite in that case
+            # to avoid an unnecessary 10+ GiB round-trip through GGUF and
+            # the rare "size = 0.000 MB" corruption that triggered the
+            # llama-quantize ``basic_ios::clear: iostream error``.
             self.log_signal.emit("\n=== Step 2: Applying padding shape fix ===")
-            cmd = (
-                f"{_shell_quote(sys.executable)} {_shell_quote(FIX_PAD_PY)} "
-                f"{_shell_quote(f16_tmp)}"
-            )
-            if self._stream_command(cmd, my_env) != 0:
-                raise RuntimeError("fix_pad.py failed. See log above.")
+            needs_fix = self._needs_pad_fix(f16_tmp)
+            if needs_fix:
+                cmd = (
+                    f"{_shell_quote(sys.executable)} {_shell_quote(FIX_PAD_PY)} "
+                    f"{_shell_quote(f16_tmp)}"
+                )
+                if self._stream_command(cmd, my_env) != 0:
+                    raise RuntimeError("fix_pad.py failed. See log above.")
+                quantize_input = fixed_tmp
+            else:
+                self.log_signal.emit(
+                    "  No 1-D pad tokens detected -- skipping fix_pad.py. "
+                    "Quantizing the F16 file directly."
+                )
+                quantize_input = f16_tmp
 
             # ── Step 3: Quantize to user-selected type ────────────────────
             self.log_signal.emit(
@@ -483,7 +519,7 @@ class ConversionThread(QThread):
                 )
             cmd = (
                 f"{_shell_quote(quantize_bin)} "
-                f"{_shell_quote(fixed_tmp)} {_shell_quote(final_out)} "
+                f"{_shell_quote(quantize_input)} {_shell_quote(final_out)} "
                 f"{self.quant_type}"
             )
             if self._stream_command(cmd, my_env) != 0:

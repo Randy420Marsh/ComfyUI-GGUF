@@ -13,6 +13,12 @@ Two scripting-friendly modes:
   --check-no-bf16   exit non-zero if the GGUF still contains any BF16 tensors
                     (useful when you need to guarantee F16-only output for a
                     Turing / RTX 20xx target)
+  --check-sizes     verify that every tensor's reported byte size matches the
+                    product of its shape and per-element dtype size, and that
+                    no tensor has zero bytes. Exits non-zero if anything is
+                    off. Use this to detect corruption that produces the
+                    notorious 'basic_ios::clear: iostream error' from
+                    llama-quantize when it tries to write a zero-byte tensor.
   --verbose         additionally list every tensor with its dtype and shape
   --metadata        dump every KV metadata field (architecture name, head
                     counts, context length, tokenizer model, etc). Use this
@@ -50,6 +56,70 @@ def _ftype_name(value):
         return gguf.LlamaFileType(value).name
     except ValueError:
         return f"UNKNOWN({value})"
+
+
+# Byte width per ggml dtype. Mirrors ggml_type_size() for the dtypes that
+# this repo's convert.py / fix_pad.py emit. Quantized blocks are reported
+# via the size of one block, which is enough to flag zero-byte corruption
+# without re-implementing the full ggml type table.
+_DTYPE_BYTES = {
+    gguf.GGMLQuantizationType.F32:  4,
+    gguf.GGMLQuantizationType.F16:  2,
+    gguf.GGMLQuantizationType.BF16: 2,
+    gguf.GGMLQuantizationType.I8:   1,
+    gguf.GGMLQuantizationType.I16:  2,
+    gguf.GGMLQuantizationType.I32:  4,
+    gguf.GGMLQuantizationType.I64:  8,
+    gguf.GGMLQuantizationType.F64:  8,
+}
+
+
+def _expected_bytes(tensor):
+    """Expected on-disk byte count for ``tensor`` from declared shape and dtype.
+
+    Returns ``None`` for quantized block dtypes whose on-disk layout depends
+    on block size -- ``check_sizes`` still flags zero-byte tensors of any
+    dtype, so returning ``None`` only skips the strict-equality check.
+    """
+    nelem = 1
+    for d in tensor.shape:
+        nelem *= int(d)
+    elt = _DTYPE_BYTES.get(tensor.tensor_type)
+    if elt is None:
+        return None
+    return nelem * elt
+
+
+def check_sizes(reader):
+    """Validate that every tensor has plausible on-disk byte counts.
+
+    Returns a list of (tensor_name, problem_description) tuples for every
+    tensor whose stored byte count is zero, or disagrees with what its
+    declared shape and dtype would imply. Empty list = file is consistent.
+    Use this to surface the corruption that produces the notorious
+    ``basic_ios::clear: iostream error`` from llama-quantize when it
+    tries to write a zero-byte tensor blob.
+    """
+    problems = []
+    for tensor in reader.tensors:
+        stored = int(tensor.data.nbytes)
+        if stored == 0:
+            problems.append((
+                tensor.name,
+                f"zero-byte tensor (shape={tuple(int(d) for d in tensor.shape)}, "
+                f"dtype={tensor.tensor_type.name}); llama-quantize will fail "
+                f"with 'basic_ios::clear: iostream error' on this file",
+            ))
+            continue
+        expected = _expected_bytes(tensor)
+        if expected is not None and stored != expected:
+            problems.append((
+                tensor.name,
+                f"size mismatch: stored={stored} B, expected={expected} B "
+                f"(shape={tuple(int(d) for d in tensor.shape)}, "
+                f"dtype={tensor.tensor_type.name})",
+            ))
+    return problems
 
 
 def _format_field_value(field):
@@ -140,6 +210,15 @@ def parse_args():
             "which has no native bf16 support."
         ),
     )
+    parser.add_argument(
+        "--check-sizes", action="store_true",
+        help=(
+            "Verify that every tensor has non-zero data and that its stored "
+            "byte count matches shape * dtype-size. Exits non-zero on any "
+            "mismatch. Use this to catch the corruption that triggers "
+            "'basic_ios::clear: iostream error' in llama-quantize."
+        ),
+    )
     args = parser.parse_args()
     if not os.path.isfile(args.path):
         parser.error(f"file not found: {args.path}")
@@ -159,6 +238,20 @@ def main():
             file=sys.stderr,
         )
         sys.exit(2)
+
+    if args.check_sizes:
+        reader = gguf.GGUFReader(args.path)
+        problems = check_sizes(reader)
+        if problems:
+            print(
+                f"\nERROR: {len(problems)} tensor(s) in {args.path} have "
+                f"corrupt size metadata:",
+                file=sys.stderr,
+            )
+            for name, msg in problems:
+                print(f"  - {name}: {msg}", file=sys.stderr)
+            sys.exit(3)
+        print("\nAll tensor sizes look consistent.")
 
 
 if __name__ == "__main__":
