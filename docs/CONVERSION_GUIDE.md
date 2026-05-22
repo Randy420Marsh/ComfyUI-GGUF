@@ -471,6 +471,47 @@ python tools/inspect_gguf.py --check-sizes /path/to/model_f16_fixed.gguf
 
 You forgot the `LD_LIBRARY_PATH` export on Linux. See [`tools/README.md`](../tools/README.md#4-linux-only-export-ld_library_path). On macOS the equivalent variable is `DYLD_LIBRARY_PATH`.
 
+### `=== Pre-flight check failed ===` `llama-quantize binary not found at …`
+
+The GUI verifies the patched `llama-quantize` binary exists **before** kicking off Step 1 (the 12+ GiB F16 conversion). If it can't find one, you'll see a pop-up like:
+
+```
+llama-quantize binary not found at /…/ComfyUI-GGUF/llama.cpp/build/bin/llama-quantize.
+Expected layout: <ComfyUI-GGUF repo root>/llama.cpp/build/bin/llama-quantize
+(set $LLAMA_CPP_DIR to override if llama.cpp lives elsewhere).
+Build it first: see tools/README.md § 3 or the wiki page
+Build-llama-quantize. The shortcut is:
+  git clone -b city96 https://github.com/Randy420Marsh/llama.cpp.git
+  …
+```
+
+The GUI looks for the binary at this fixed path:
+
+```
+<ComfyUI-GGUF repo root>/
+  llama.cpp/
+    build/
+      bin/
+        llama-quantize          # Linux / macOS
+        Release/llama-quantize.exe  # Windows
+```
+
+Two ways to fix:
+
+1. **Clone `llama.cpp` inside the `ComfyUI-GGUF` repo root** (recommended — matches every example in [`tools/README.md`](../tools/README.md) and the [Build-llama-quantize wiki](https://github.com/Randy420Marsh/ComfyUI-GGUF/wiki/Build-llama-quantize)). From the repo root:
+   ```bash
+   git clone -b city96 https://github.com/Randy420Marsh/llama.cpp.git
+   cd llama.cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release \
+     -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON
+   cmake --build build --config Release -j --target llama-quantize
+   ```
+2. **Point the GUI at an out-of-tree `llama.cpp` clone** via env var:
+   ```bash
+   export LLAMA_CPP_DIR=/abs/path/to/llama.cpp
+   python tools/gguf_gui.py
+   ```
+   `LD_LIBRARY_PATH` is set automatically from `LLAMA_CPP_DIR` for the GUI workflow.
+
 ### `git apply: patch does not apply` when applying `lcpp.patch`
 
 Either you're not on `tags/b3962` (`git -C llama.cpp describe --tags` should print `b3962`) or your Git rewrote `lcpp.patch` to CRLF on clone. Run `python tools/fix_lines_ending.py` and retry, or pass `--ignore-whitespace` to `git apply` as a last resort.
