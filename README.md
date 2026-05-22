@@ -13,6 +13,27 @@ This is a fork of [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) 
 
 Use this repo's URL when installing, cloning the tools, or filing bug reports about the fork-specific features. Issues that exist in the upstream loader (everything outside the bullets above) should be reported to [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF/issues) where the original author can triage them.
 
+## Documentation
+
+The repo carries three layers of documentation depending on what you're trying to do:
+
+| Where | Audience | Content |
+|---|---|---|
+| **This file** (`README.md`) | First-time visitors | What the fork is, what's new vs. upstream, how to install the custom node, list of pre-quantized model links. |
+| [`tools/README.md`](https://github.com/Randy420Marsh/ComfyUI-GGUF/blob/main/tools/README.md) | Anyone converting their own models | Setup reference doc for `convert.py` + `gguf_gui.py` + the patched `llama-quantize` build. Covers venv, dependencies, `LD_LIBRARY_PATH`, GUI controls, Analyze button, CLI invocations, troubleshooting, platform notes (VS2022, CUDA, macOS). |
+| [`docs/CONVERSION_GUIDE.md`](https://github.com/Randy420Marsh/ComfyUI-GGUF/blob/main/docs/CONVERSION_GUIDE.md) | Anyone converting a specific model | Long-form per-model walkthrough: Flux, SD3 / SD3.5, ERNIE-Image (Ministral-3-3B text encoder), Z-Image / Lumina2 / RedCraft ZiB, Hunyuan Video, Wan 2.1, plus the math behind the Analyze recommendation and a quant-types reference. |
+| **Wiki** ([landing page](https://github.com/Randy420Marsh/ComfyUI-GGUF/wiki)) | Anyone who prefers a browseable nav | Mirror of the above plus the shortcut build recipe. |
+
+### Wiki pages
+
+- **[Home](https://github.com/Randy420Marsh/ComfyUI-GGUF/wiki)** — index + fork-features → PR table mapping each addition in this fork to the PR that introduced it.
+- **[Build the patched llama-quantize](https://github.com/Randy420Marsh/ComfyUI-GGUF/wiki/Build-llama-quantize)** — build recipe using the **pre-patched** [`city96` branch](https://github.com/Randy420Marsh/llama.cpp/tree/city96) of [`Randy420Marsh/llama.cpp`](https://github.com/Randy420Marsh/llama.cpp) so you don't have to `git clone llama.cpp + git checkout tags/b3962 + git apply lcpp.patch` by hand. Covers CPU / CUDA / Windows builds, `LD_LIBRARY_PATH` setup, and a smoke test. The manual `lcpp.patch` route is still documented inside [`tools/README.md`](https://github.com/Randy420Marsh/ComfyUI-GGUF/blob/main/tools/README.md#3-build-the-patched-llama-quantize) as a fallback.
+- **[Conversion-Guide](https://github.com/Randy420Marsh/ComfyUI-GGUF/wiki/Conversion-Guide)** — wiki mirror of [`docs/CONVERSION_GUIDE.md`](https://github.com/Randy420Marsh/ComfyUI-GGUF/blob/main/docs/CONVERSION_GUIDE.md) with the relative `../tools/README.md` links rewritten to absolute URLs so they resolve from the wiki.
+
+The in-repo `tools/README.md` and `docs/CONVERSION_GUIDE.md` are the source of truth; the wiki pages mirror them for browseability. If you're filing a bug or PR, edit the in-repo files.
+
+---
+
 These custom nodes provide support for model files stored in the GGUF format popularized by [llama.cpp](https://github.com/ggerganov/llama.cpp).
 
 While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
