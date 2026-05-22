@@ -2,9 +2,18 @@
 # Install into a SEPARATE venv from ComfyUI -- these tools are
 # independent of the inference-time ComfyUI environment.
 #
-#     python -m venv .venv-convert
-#     source .venv-convert/bin/activate     # (Linux/macOS)
-#     .venv-convert\Scripts\activate.bat    # (Windows)
+# Recommended (uv-based, matches tools/README.md):
+#
+#     uv venv venv --python 3.11
+#     source venv/bin/activate          # (Linux/macOS)
+#     venv\Scripts\activate.bat         # (Windows)
+#     uv pip install -r tools/requirements-conversion.txt
+#
+# Plain pip also works:
+#
+#     python -m venv venv
+#     source venv/bin/activate
+#     pip install -U pip
 #     pip install -r tools/requirements-conversion.txt
 #
 # This is NOT the same as the root-level requirements.txt; that one only
@@ -12,13 +21,23 @@
 # tiny because ComfyUI already provides torch / numpy / etc.).
 #
 # Versions below are minimums known to work, not pins -- newer is fine.
+# Floors track a recently validated environment (Python 3.11, CUDA 13).
 
+# Core conversion stack -- used by tools/convert.py, inspect_gguf.py,
+# fix_pad.py, fix_5d_tensors.py, analyze_model.py.
 gguf>=0.19.0
-safetensors>=0.4.0
+safetensors>=0.7.0
 torch>=2.1
 numpy>=1.24
 tqdm>=4.65
 
-# Optional but recommended: the GUI converter (tools/gguf_gui.py) needs Qt.
-# Skip this if you only use the CLI tools (convert.py / inspect_gguf.py / etc.).
+# Qt GUI front-end (tools/gguf_gui.py). Skip if you only use the CLI.
 PySide6>=6.5
+
+# Optional: only needed if you also intend to run the ComfyUI-side loader
+# (loader.py) against the GGUFs you produce, which reconstructs tokenizers
+# for mistral3 / ERNIE-Image / Gemma-3. Conversion itself does not need
+# these, so feel free to omit them on a build-only machine.
+#
+#   sentencepiece>=0.2.0
+#   protobuf>=4.25

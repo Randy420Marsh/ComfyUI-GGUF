@@ -17,10 +17,68 @@ from gguf import GGUFReader
 # analyze_model lives in the same tools/ directory; import it directly
 # rather than via tools.* so the GUI script remains runnable as a
 # top-level `python tools/gguf_gui.py` from the repo root.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_TOOLS_DIR)
+sys.path.insert(0, _TOOLS_DIR)
 import analyze_model
 
 CONFIG_FILE = "settings.json"
+
+# Paths to the conversion helper scripts and the llama.cpp build output are
+# all derived from this file's own location so the GUI works regardless of
+# the user's working directory (repo root, tools/, or anywhere else).
+#
+# llama.cpp is expected to be cloned and built inside the repo root, i.e.
+# <repo_root>/llama.cpp/build/... -- this matches the layout in
+# tools/README.md. Set LLAMA_CPP_DIR to override.
+CONVERT_PY = os.path.join(_TOOLS_DIR, "convert.py")
+FIX_PAD_PY = os.path.join(_TOOLS_DIR, "fix_pad.py")
+
+
+def _resolve_llama_cpp_dir():
+    """Locate the llama.cpp clone that contains the patched llama-quantize.
+
+    Search order:
+      1. $LLAMA_CPP_DIR (explicit override)
+      2. <repo_root>/llama.cpp   (the layout tools/README.md documents)
+      3. ./llama.cpp relative to the current working directory (legacy
+         behaviour, kept so users who launched the GUI from the repo
+         root in older versions still work)
+
+    Returns an absolute path. The directory is not required to exist at
+    import time -- existence is checked later when llama-quantize is
+    actually invoked, so the GUI can still load when the build is missing.
+    """
+    override = os.environ.get("LLAMA_CPP_DIR")
+    if override:
+        return os.path.abspath(override)
+    repo_local = os.path.join(_REPO_ROOT, "llama.cpp")
+    if os.path.isdir(repo_local):
+        return repo_local
+    return os.path.abspath(os.path.join(os.getcwd(), "llama.cpp"))
+
+
+LLAMA_CPP_DIR = _resolve_llama_cpp_dir()
+LLAMA_QUANTIZE_BIN = os.path.join(
+    LLAMA_CPP_DIR, "build", "bin", "llama-quantize"
+)
+LLAMA_QUANTIZE_BIN_WIN = os.path.join(
+    LLAMA_CPP_DIR, "build", "bin", "Release", "llama-quantize.exe"
+)
+LD_PATH_BUILD_SRC = os.path.join(LLAMA_CPP_DIR, "build", "src")
+LD_PATH_BUILD_GGML_SRC = os.path.join(LLAMA_CPP_DIR, "build", "ggml", "src")
+
+
+def _shell_quote(path):
+    """Quote a path for safe interpolation into a shell command string.
+
+    The GUI uses subprocess.Popen(..., shell=True) for streaming, so any
+    path that contains spaces, parentheses, or other shell-significant
+    characters needs explicit quoting.
+    """
+    if os.name == "nt":
+        return '"' + path.replace('"', '\\"') + '"'
+    return "'" + path.replace("'", "'\\''") + "'"
 
 # Output GGUF types supported by llama-quantize at the tag `tools/lcpp.patch`
 # targets (b3962). Each entry is (name, description) — the description is
@@ -327,9 +385,18 @@ class ConversionThread(QThread):
         filename = os.path.basename(self.src)
 
         my_env = os.environ.copy()
+        # Absolute paths so llama-quantize finds libggml.so / libllama.so
+        # regardless of which directory the GUI was launched from.
         my_env["LD_LIBRARY_PATH"] = (
-            "./llama.cpp/build/src:./llama.cpp/build/ggml/src:"
+            LD_PATH_BUILD_SRC + os.pathsep
+            + LD_PATH_BUILD_GGML_SRC + os.pathsep
             + my_env.get("LD_LIBRARY_PATH", "")
+        )
+        # macOS uses DYLD_LIBRARY_PATH; set both so the same code path works.
+        my_env["DYLD_LIBRARY_PATH"] = (
+            LD_PATH_BUILD_SRC + os.pathsep
+            + LD_PATH_BUILD_GGML_SRC + os.pathsep
+            + my_env.get("DYLD_LIBRARY_PATH", "")
         )
 
         # Paths are always derived from the *original* filename so that the
@@ -382,15 +449,19 @@ class ConversionThread(QThread):
                     else f" --dtype {self.dtype_cli}"
                 )
                 cmd = (
-                    f"python ComfyUI-GGUF/tools/convert.py "
-                    f"--src '{src_for_convert}' --dst '{f16_tmp}'{dtype_arg}"
+                    f"{_shell_quote(sys.executable)} {_shell_quote(CONVERT_PY)} "
+                    f"--src {_shell_quote(src_for_convert)} "
+                    f"--dst {_shell_quote(f16_tmp)}{dtype_arg}"
                 )
                 if self._stream_command(cmd, my_env) != 0:
                     raise RuntimeError("F16 conversion failed. See log above.")
 
             # ── Step 2: Padding shape fix ─────────────────────────────────
             self.log_signal.emit("\n=== Step 2: Applying padding shape fix ===")
-            cmd = f"python ComfyUI-GGUF/tools/fix_pad.py '{f16_tmp}'"
+            cmd = (
+                f"{_shell_quote(sys.executable)} {_shell_quote(FIX_PAD_PY)} "
+                f"{_shell_quote(f16_tmp)}"
+            )
             if self._stream_command(cmd, my_env) != 0:
                 raise RuntimeError("fix_pad.py failed. See log above.")
 
@@ -398,9 +469,22 @@ class ConversionThread(QThread):
             self.log_signal.emit(
                 f"\n=== Step 3: Quantizing to {self.quant_type} ==="
             )
+            quantize_bin = (
+                LLAMA_QUANTIZE_BIN_WIN
+                if os.name == "nt" and os.path.exists(LLAMA_QUANTIZE_BIN_WIN)
+                else LLAMA_QUANTIZE_BIN
+            )
+            if not os.path.exists(quantize_bin):
+                raise RuntimeError(
+                    f"llama-quantize binary not found at {quantize_bin}.\n"
+                    "Build it first (see tools/README.md \u00a7 3), or set the\n"
+                    "LLAMA_CPP_DIR environment variable to the root of your\n"
+                    "llama.cpp clone."
+                )
             cmd = (
-                f"./llama.cpp/build/bin/llama-quantize "
-                f"'{fixed_tmp}' '{final_out}' {self.quant_type}"
+                f"{_shell_quote(quantize_bin)} "
+                f"{_shell_quote(fixed_tmp)} {_shell_quote(final_out)} "
+                f"{self.quant_type}"
             )
             if self._stream_command(cmd, my_env) != 0:
                 raise RuntimeError(
