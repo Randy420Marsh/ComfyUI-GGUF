@@ -12,7 +12,14 @@ ComfyUI's environment.
 
 For a step-by-step walkthrough that covers a full end-to-end conversion of
 a specific model (Z-Image / Lumina2 / Flux / ERNIE-Image), see
-[`docs/CONVERSION_GUIDE.md`](../docs/CONVERSION_GUIDE.md).
+[`docs/CONVERSION_GUIDE.md`](../docs/CONVERSION_GUIDE.md). The same content
+is also browseable on the wiki at
+[`Conversion-Guide`](https://github.com/Randy420Marsh/ComfyUI-GGUF/wiki/Conversion-Guide),
+which links to a separate
+[`Build the patched llama-quantize`](https://github.com/Randy420Marsh/ComfyUI-GGUF/wiki/Build-llama-quantize)
+page using the pre-patched
+[`Randy420Marsh/llama.cpp` `city96` branch](https://github.com/Randy420Marsh/llama.cpp/tree/city96)
+(no `git apply` step required).
 
 ---
 
@@ -98,6 +105,18 @@ The `requirements-conversion.txt` file lists minimum versions; newer is fine. `t
 
 Standard upstream `llama.cpp` doesn't know how to quantize image-model tensors (the K/IQ block kernels were written for LLM weight shapes). The `lcpp.patch` here teaches it to.
 
+**Shortcut (recommended):** clone the pre-patched [`city96` branch](https://github.com/Randy420Marsh/llama.cpp/tree/city96) of [`Randy420Marsh/llama.cpp`](https://github.com/Randy420Marsh/llama.cpp). That branch is upstream `ggml-org/llama.cpp` at tag `b3962` with `lcpp.patch` already applied — no `git apply` step, no CRLF normalisation, no `--ignore-whitespace` workaround:
+
+```bash
+git clone -b city96 https://github.com/Randy420Marsh/llama.cpp.git
+cd llama.cpp
+```
+
+The longer wiki page [Build the patched llama-quantize](https://github.com/Randy420Marsh/ComfyUI-GGUF/wiki/Build-llama-quantize) covers CUDA-build variants and the smoke-test step in more detail.
+
+<details>
+<summary><b>Manual patch path (if you'd rather not trust the fork or want a different upstream base)</b></summary>
+
 Clone `llama.cpp` next to `ComfyUI-GGUF`, check out the exact tag the patch is written against, and apply it:
 
 ```bash
@@ -108,6 +127,8 @@ git apply ../ComfyUI-GGUF/tools/lcpp.patch
 ```
 
 If `git apply` complains about line endings, run `python ../ComfyUI-GGUF/tools/fix_lines_ending.py` first (it converts `lcpp.patch` CRLF → LF in place) and retry. As a last resort, `git apply --ignore-whitespace ../ComfyUI-GGUF/tools/lcpp.patch` also works.
+
+</details>
 
 Build just the quantizer target (don't build everything — `llama.cpp` is huge):
 
