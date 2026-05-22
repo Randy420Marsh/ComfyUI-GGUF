@@ -66,11 +66,11 @@ brew install cmake
 ### 1. Clone this repo
 
 ```bash
-git clone https://github.com/city96/ComfyUI-GGUF.git
+git clone https://github.com/Randy420Marsh/ComfyUI-GGUF.git
 cd ComfyUI-GGUF
 ```
 
-(If you're using this fork — `Randy420Marsh/ComfyUI-GGUF` — substitute that URL.)
+The conversion tooling, the Qt GUI front-end (`gguf_gui.py`), `requirements-conversion.txt`, `inspect_gguf.py --metadata`, and the long-form `docs/CONVERSION_GUIDE.md` all live in this fork. The upstream [`city96/ComfyUI-GGUF`](https://github.com/city96/ComfyUI-GGUF) repo has the original `convert.py` but does **not** carry any of these additions, so cloning that one will leave you without the GUI and the architectures this README describes (Ministral-3/ERNIE-Image, Gemma-4 tokenizer.json sidecar, scaled-fp8 dequant, etc.).
 
 ### 2. Create a conversion virtualenv and install dependencies
 
