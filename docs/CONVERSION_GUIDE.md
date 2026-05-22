@@ -351,7 +351,7 @@ Click **Analyze** in the GUI (or run `python tools/analyze_model.py <path.safete
 ### What it reads
 
 1. **Architecture** — by re-using the same `ModelXxx.keys_detect` logic that `convert.py` uses to dispatch the converter. So whatever `convert.py` would pick, Analyze picks the same.
-2. **Weight bytes per quant** — by walking the safetensors header and applying `convert.py`'s promote-to-F32 rules tensor-by-tensor (1-D tensors / ≤ 1024 elems / arch-specific `keys_hiprec` blacklist stay F32 regardless of the chosen quant). So the weight column is exact for each candidate quant, not an estimate.
+2. **Weight bytes per quant** — by walking the model's tensor index and applying `convert.py`'s promote-to-F32 rules tensor-by-tensor (1-D tensors / ≤ 1024 elems / arch-specific `keys_hiprec` blacklist stay F32 regardless of the chosen quant). So the weight column is exact for each candidate quant, not an estimate. The tensor index is read from either the safetensors JSON header (offset 8) or the GGUF tensor list (`gguf.GGUFReader`) depending on the input file — so you can point **Analyze** at either a pre-conversion `.safetensors` or an already-converted `.gguf` (intermediate F16 or final quantized) and get the same matrix.
 3. **Hidden dim** — from a reference tensor key per arch (e.g. `to_q.weight.shape[0]`, `x_embedder.proj.weight.shape[0]`). The exact key it used is shown under `hidden_dim source key:` so the math is auditable.
 4. **Layer count** — from a prefix scan over tensor names (`layers.N.` distinct N).
 5. **Patch size** — derived from the detected arch class.

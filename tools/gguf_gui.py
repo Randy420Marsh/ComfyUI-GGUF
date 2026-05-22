@@ -585,8 +585,9 @@ class MainWindow(QMainWindow):
         row.addWidget(b)
         self.analyze_btn = QPushButton("Analyze")
         self.analyze_btn.setToolTip(
-            "Read the safetensors header and recommend a quant type for "
-            "the detected GPU. No weights are loaded; runs in seconds."
+            "Read the model's tensor index (.safetensors header or GGUF "
+            "tensor list) and recommend a quant type for the detected GPU. "
+            "No weights are loaded; runs in seconds."
         )
         self.analyze_btn.clicked.connect(self.start_analyze)
         row.addWidget(self.analyze_btn)
@@ -694,7 +695,8 @@ class MainWindow(QMainWindow):
 
     def browse_src(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Model", "", "Weights (*.safetensors)"
+            self, "Select Model", "",
+            "Weights (*.safetensors *.gguf);;safetensors (*.safetensors);;GGUF (*.gguf);;All files (*)",
         )
         if path:
             self.input_field.setText(path.strip())
@@ -728,7 +730,7 @@ class MainWindow(QMainWindow):
             file_path = file_path[7:]
         file_path = unquote(file_path).strip()
 
-        if file_path.endswith(".safetensors"):
+        if file_path.endswith((".safetensors", ".gguf")):
             self.input_field.setText(file_path)
             if not self.out_field.text().strip():
                 self.out_field.setText(os.path.dirname(file_path))
@@ -872,13 +874,16 @@ class MainWindow(QMainWindow):
 
     def start_analyze(self):
         """Run analyze_model.analyze() against the currently-selected
-        .safetensors path on a worker thread, then pop the result dialog.
+        .safetensors or .gguf path on a worker thread, then pop the result
+        dialog. GGUF inputs are read via gguf.GGUFReader -- useful for
+        re-evaluating an already-converted intermediate against the same
+        VRAM / quant matrix.
         """
         src = self.input_field.text().strip()
         if not src:
             QMessageBox.warning(
                 self, "Analyze",
-                "Pick a .safetensors file first (Browse or drag-and-drop).",
+                "Pick a .safetensors or .gguf file first (Browse or drag-and-drop).",
             )
             return
         if not os.path.isfile(src):

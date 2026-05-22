@@ -29,7 +29,7 @@ page using the pre-patched
 |---|---|
 | `convert.py` | Convert a `.safetensors` UNET / DiT into a `BF16` or `F16` GGUF. |
 | `gguf_gui.py` | Qt GUI that wraps `convert.py` + `llama-quantize` + the inspect/fix helpers, with GPU auto-detection, dtype mode, quant selector, and an Analyze button. |
-| `analyze_model.py` | Library used by the Analyze button (also runnable from the CLI). Reads a safetensors header and produces a per-quant VRAM table — see [Analyze](#analyze-pick-a-quant-from-the-model-and-your-gpu). |
+| `analyze_model.py` | Library used by the Analyze button (also runnable from the CLI). Reads a `.safetensors` header **or** a `.gguf` tensor index and produces a per-quant VRAM table — see [Analyze](#analyze-pick-a-quant-from-the-model-and-your-gpu). |
 | `inspect_gguf.py` | Print arch / file type / per-tensor dtype histogram of an existing GGUF. Has `--check-no-bf16` for CI / scripting, `--check-sizes` for catching zero-byte / corrupt tensors that crash `llama-quantize` with `basic_ios::clear: iostream error`, and `--metadata` for the full KV section. |
 | `fix_pad.py` | Reshape 1-D `x_pad_token` / `cap_pad_token` to `[1, dim]` on Z-Image / Lumina2 GGUFs so `llama-quantize` doesn't choke on them. Auto-detects no-op cases (Z-Image 0.36 non-Turbo and similar checkpoints already ship 2-D pad tokens) and fast-copies the file unchanged in those cases. **Run between `convert.py` and `llama-quantize` for those models, not after.** |
 | `fix_5d_tensors.py` | Re-attach the 5D tensors that `convert.py` strips from Hunyuan Video / Wan 2.1 GGUFs. Run **after** `llama-quantize`. |
@@ -225,7 +225,7 @@ The GUI handles convert → fix → quantize → inspect end-to-end. Key control
 
 #### Analyze (pick a quant from the model and your GPU)
 
-Click **Analyze** next to **Browse** to read the safetensors header (no weight load) and pop a dialog with a per-quant VRAM table. The estimate is **100% model-derived** — no hardcoded "Flux is 12B" tables. It:
+Click **Analyze** next to **Browse** to read the model's tensor index (no weight load) and pop a dialog with a per-quant VRAM table. Works on both `.safetensors` and `.gguf` inputs — the former parses the JSON header at offset 8, the latter walks the GGUF tensor list via `gguf.GGUFReader`. Useful when re-evaluating an already-converted intermediate (e.g. comparing the city96 pre-quantized Z-Image Turbo against a fresh Z-Image 0.36 F16 conversion). The estimate is **100% model-derived** — no hardcoded "Flux is 12B" tables. It:
 
 1. Detects the architecture by re-using the same `ModelXxx.keys_detect` logic `convert.py` uses (ERNIE, Flux, Lumina2/Z-Image, SD3, Hunyuan, SDXL, SD1, …), so detection is authoritative.
 2. Computes **weight bytes per quant** by mirroring `convert.py`'s promote-to-F32 rules (1-D tensors / ≤ 1024 elems / `keys_hiprec` blacklist stay F32).
