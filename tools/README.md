@@ -28,7 +28,9 @@ page using the pre-patched
 | File | Purpose |
 |---|---|
 | `convert.py` | Convert a `.safetensors` UNET / DiT into a `BF16` or `F16` GGUF. |
+| `gguf_pipeline.py` | Headless one-shot CLI that mirrors the GUI's "Run" button (convert + `fix_pad` if needed + `llama-quantize` + `fix_5d_tensors` if needed). Shares orchestration with the GUI via `pipeline_lib.py`. |
 | `gguf_gui.py` | Qt GUI that wraps `convert.py` + `llama-quantize` + the inspect/fix helpers, with GPU auto-detection, dtype mode, quant selector, and an Analyze button. |
+| `pipeline_lib.py` | Shared pipeline orchestration imported by both `gguf_gui.py` and `gguf_pipeline.py`. Single source of truth for the pre-flight `llama-quantize` check, Step 2 skip heuristic, and `LLAMA_QUANTIZE_TYPES` listing. |
 | `analyze_model.py` | Library used by the Analyze button (also runnable from the CLI). Reads a `.safetensors` header **or** a `.gguf` tensor index and produces a per-quant VRAM table — see [Analyze](#analyze-pick-a-quant-from-the-model-and-your-gpu). |
 | `inspect_gguf.py` | Print arch / file type / per-tensor dtype histogram of an existing GGUF. Has `--check-no-bf16` for CI / scripting, `--check-sizes` for catching zero-byte / corrupt tensors that crash `llama-quantize` with `basic_ios::clear: iostream error`, and `--metadata` for the full KV section. |
 | `fix_pad.py` | Reshape 1-D `x_pad_token` / `cap_pad_token` to `[1, dim]` on Z-Image / Lumina2 GGUFs so `llama-quantize` doesn't choke on them. Auto-detects no-op cases (Z-Image 0.36 non-Turbo and similar checkpoints already ship 2-D pad tokens) and fast-copies the file unchanged in those cases. **Run between `convert.py` and `llama-quantize` for those models, not after.** |
@@ -272,6 +274,31 @@ fits = total <= (VRAM - 1 GB headroom)
 The budget intentionally **excludes** the VAE and text encoder — those are loaded by separate `*CLIPLoader (gguf)` / `Load VAE` nodes in the standard ComfyUI-GGUF workflow and don't co-reside with the diffusion model during the denoising step.
 
 ### Option B — CLI
+
+#### One-shot pipeline (`gguf_pipeline.py`)
+
+For most users this is the right CLI entry point — it mirrors the GUI's "Run GGUF Conversion Pipeline" button (Step 0 5-D pre-fold → `convert.py` → conditional `fix_pad.py` → `llama-quantize` → optional `fix_5d_tensors.py`) in a single command, sharing the orchestration code with the GUI via `pipeline_lib.py`.
+
+```bash
+python tools/gguf_pipeline.py \
+  --src /path/to/model.safetensors \
+  --dst-dir /path/to/out \
+  --quant Q4_K_M           # default; see python tools/gguf_pipeline.py --help for all 39 types
+```
+
+Flags:
+
+- `--src` (required) — source `.safetensors` file. Any of the 13 architectures `convert.py` knows about (Flux, SD1, SDXL, SD3, AuraFlow, HiDream, Hunyuan-DiT, Hunyuan Video, Wan, LTXV, Cosmos, Lumina2 / Z-Image, ERNIE-Image) plus the runtime-only `qwen_image` arch.
+- `--dst-dir` (required) — output directory for the final quantized `.gguf`. Created if missing.
+- `--temp-dir` — intermediate file directory. Defaults to `<dst-dir>/temp`.
+- `--quant TYPE` — any of the 39 types listed in `--help` (Q*, IQ*, TQ*, F16, BF16, F32, COPY). Default `Q4_K_M`.
+- `--dtype {auto,fp16,bf16}` — F16-intermediate dtype. Default `auto` preserves the source dtype. **Use `--dtype fp16` on Turing (RTX 20xx) or anywhere bf16 isn't natively supported.**
+- `--keep-intermediate` — don't delete the `_f16.gguf` / `_5dfixed.safetensors` after a successful run.
+- `--no-fix-5d` — skip the post-quantize 5-D tensor re-attach pass.
+
+The pre-flight `llama-quantize` check fires before any of the expensive Steps 1–3 run, so a missing build fails in seconds instead of after a 12 GiB write.
+
+If you want manual control over each step, the per-step CLI tools below still exist:
 
 #### Convert `.safetensors` → GGUF (intermediate F16 / BF16)
 

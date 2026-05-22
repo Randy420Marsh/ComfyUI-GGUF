@@ -24,149 +24,19 @@ import analyze_model
 
 CONFIG_FILE = "settings.json"
 
-# Paths to the conversion helper scripts and the llama.cpp build output are
-# all derived from this file's own location so the GUI works regardless of
-# the user's working directory (repo root, tools/, or anywhere else).
-#
-# llama.cpp is expected to be cloned and built inside the repo root, i.e.
-# <repo_root>/llama.cpp/build/... -- this matches the layout in
-# tools/README.md. Set LLAMA_CPP_DIR to override.
-CONVERT_PY = os.path.join(_TOOLS_DIR, "convert.py")
-FIX_PAD_PY = os.path.join(_TOOLS_DIR, "fix_pad.py")
-
-
-def _resolve_llama_cpp_dir():
-    """Locate the llama.cpp clone that contains the patched llama-quantize.
-
-    Search order:
-      1. $LLAMA_CPP_DIR (explicit override)
-      2. <repo_root>/llama.cpp   (the layout tools/README.md documents)
-      3. ./llama.cpp relative to the current working directory (legacy
-         behaviour, kept so users who launched the GUI from the repo
-         root in older versions still work)
-
-    Returns an absolute path. The directory is not required to exist at
-    import time -- existence is checked later when llama-quantize is
-    actually invoked, so the GUI can still load when the build is missing.
-    """
-    override = os.environ.get("LLAMA_CPP_DIR")
-    if override:
-        return os.path.abspath(override)
-    repo_local = os.path.join(_REPO_ROOT, "llama.cpp")
-    if os.path.isdir(repo_local):
-        return repo_local
-    return os.path.abspath(os.path.join(os.getcwd(), "llama.cpp"))
-
-
-LLAMA_CPP_DIR = _resolve_llama_cpp_dir()
-LLAMA_QUANTIZE_BIN = os.path.join(
-    LLAMA_CPP_DIR, "build", "bin", "llama-quantize"
+# Pipeline orchestration constants and helpers live in pipeline_lib so the
+# headless tools/gguf_pipeline.py CLI and this GUI share a single source of
+# truth.  Re-export the names the rest of the GUI module (combo boxes,
+# start_workflow's pre-flight check, settings.json defaults) already uses.
+from pipeline_lib import (
+    locate_llama_quantize,
+    LLAMA_CPP_DIR,
+    LLAMA_QUANTIZE_BIN,
+    LLAMA_QUANTIZE_BIN_WIN,
+    LLAMA_QUANTIZE_TYPES,
+    DEFAULT_QUANT_TYPE,
+    run_pipeline as _pipeline_run,
 )
-LLAMA_QUANTIZE_BIN_WIN = os.path.join(
-    LLAMA_CPP_DIR, "build", "bin", "Release", "llama-quantize.exe"
-)
-LD_PATH_BUILD_SRC = os.path.join(LLAMA_CPP_DIR, "build", "src")
-LD_PATH_BUILD_GGML_SRC = os.path.join(LLAMA_CPP_DIR, "build", "ggml", "src")
-
-
-def locate_llama_quantize():
-    """Return ``(bin_path, error_or_None)`` for the patched llama-quantize.
-
-    Tries the Windows Release path first on Windows, then the POSIX path
-    on every platform. Returns the *expected* path even on miss so the
-    error message can quote it back to the user.
-
-    Used by ``start_workflow`` for the pre-flight check and by
-    ``ConversionThread.run`` defensively in case the binary disappears
-    between the pre-flight and Step 3 (e.g. user rebuilds llama.cpp in
-    a separate shell mid-conversion).
-    """
-    if os.name == "nt" and os.path.exists(LLAMA_QUANTIZE_BIN_WIN):
-        return LLAMA_QUANTIZE_BIN_WIN, None
-    if os.path.exists(LLAMA_QUANTIZE_BIN):
-        return LLAMA_QUANTIZE_BIN, None
-    expected = (
-        LLAMA_QUANTIZE_BIN_WIN if os.name == "nt" else LLAMA_QUANTIZE_BIN
-    )
-    override_msg = (
-        f"$LLAMA_CPP_DIR override active -> {LLAMA_CPP_DIR!r}\n"
-        if os.environ.get("LLAMA_CPP_DIR")
-        else (
-            "Expected layout: <ComfyUI-GGUF repo root>/llama.cpp/build/bin/llama-quantize\n"
-            "(set $LLAMA_CPP_DIR to override if llama.cpp lives elsewhere).\n"
-        )
-    )
-    err = (
-        f"llama-quantize binary not found at {expected}.\n"
-        f"{override_msg}"
-        "Build it first: see tools/README.md \u00a7 3 or the wiki page\n"
-        "Build-llama-quantize. The shortcut is:\n"
-        "  git clone -b city96 https://github.com/Randy420Marsh/llama.cpp.git\n"
-        "  cd llama.cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release \\\n"
-        "    -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON\n"
-        "  cmake --build build --config Release -j --target llama-quantize\n"
-    )
-    return expected, err
-
-
-def _shell_quote(path):
-    """Quote a path for safe interpolation into a shell command string.
-
-    The GUI uses subprocess.Popen(..., shell=True) for streaming, so any
-    path that contains spaces, parentheses, or other shell-significant
-    characters needs explicit quoting.
-    """
-    if os.name == "nt":
-        return '"' + path.replace('"', '\\"') + '"'
-    return "'" + path.replace("'", "'\\''") + "'"
-
-# Output GGUF types supported by llama-quantize at the tag `tools/lcpp.patch`
-# targets (b3962). Each entry is (name, description) — the description is
-# verbatim from quantize.cpp:quant_options at that tag. Order chosen to
-# match the upstream CLI help so the GUI mirrors what `llama-quantize`
-# itself shows.
-LLAMA_QUANTIZE_TYPES = [
-    ("Q4_0",     "4.34G, +0.4685 ppl @ Llama-3-8B"),
-    ("Q4_1",     "4.78G, +0.4511 ppl @ Llama-3-8B"),
-    ("Q5_0",     "5.21G, +0.1316 ppl @ Llama-3-8B"),
-    ("Q5_1",     "5.65G, +0.1062 ppl @ Llama-3-8B"),
-    ("IQ2_XXS",  "2.06 bpw quantization"),
-    ("IQ2_XS",   "2.31 bpw quantization"),
-    ("IQ2_S",    "2.5  bpw quantization"),
-    ("IQ2_M",    "2.7  bpw quantization"),
-    ("IQ1_S",    "1.56 bpw quantization"),
-    ("IQ1_M",    "1.75 bpw quantization"),
-    ("TQ1_0",    "1.69 bpw ternarization"),
-    ("TQ2_0",    "2.06 bpw ternarization"),
-    ("Q2_K",     "2.96G, +3.5199 ppl @ Llama-3-8B"),
-    ("Q2_K_S",   "2.96G, +3.1836 ppl @ Llama-3-8B"),
-    ("IQ3_XXS",  "3.06 bpw quantization"),
-    ("IQ3_S",    "3.44 bpw quantization"),
-    ("IQ3_M",    "3.66 bpw quantization mix"),
-    ("Q3_K",     "alias for Q3_K_M"),
-    ("IQ3_XS",   "3.3 bpw quantization"),
-    ("Q3_K_S",   "3.41G, +1.6321 ppl @ Llama-3-8B"),
-    ("Q3_K_M",   "3.74G, +0.6569 ppl @ Llama-3-8B"),
-    ("Q3_K_L",   "4.03G, +0.5562 ppl @ Llama-3-8B"),
-    ("IQ4_NL",   "4.50 bpw non-linear quantization"),
-    ("IQ4_XS",   "4.25 bpw non-linear quantization"),
-    ("Q4_K",     "alias for Q4_K_M"),
-    ("Q4_K_S",   "4.37G, +0.2689 ppl @ Llama-3-8B"),
-    ("Q4_K_M",   "4.58G, +0.1754 ppl @ Llama-3-8B  (recommended default for 8 GB VRAM)"),
-    ("Q5_K",     "alias for Q5_K_M"),
-    ("Q5_K_S",   "5.21G, +0.1049 ppl @ Llama-3-8B"),
-    ("Q5_K_M",   "5.33G, +0.0569 ppl @ Llama-3-8B  (sweet spot if it fits)"),
-    ("Q6_K",     "6.14G, +0.0217 ppl @ Llama-3-8B"),
-    ("Q8_0",     "7.96G, +0.0026 ppl @ Llama-3-8B  (~8 bpw; rarely fits on 8 GB)"),
-    ("Q4_0_4_4", "4.34G, ARM-only repack of Q4_0 (do not use on x86 GPUs)"),
-    ("Q4_0_4_8", "4.34G, ARM-only repack of Q4_0 (do not use on x86 GPUs)"),
-    ("Q4_0_8_8", "4.34G, ARM-only repack of Q4_0 (do not use on x86 GPUs)"),
-    ("F16",      "~14 G; no quantization, half-precision storage"),
-    ("BF16",     "~14 G; no quantization, bf16 storage (Ampere+ only at runtime)"),
-    ("F32",      "~28 G; no quantization, full float32 (debugging only)"),
-    ("COPY",     "copy tensors verbatim, no quantization (debugging)"),
-]
-DEFAULT_QUANT_TYPE = "Q4_K_M"
 
 # Minimum NVIDIA compute capability for native BF16 tensor-core support.
 # Ampere = 8.0 (A100), 8.6 (RTX 30xx), 8.9 (Ada/RTX 40xx), 9.0 (Hopper/H100),
@@ -286,16 +156,6 @@ def resolve_auto_dtype():
     )
 
 
-# fix_5d_tensors_{arch}.safetensors files that convert.py may leave behind.
-# If they exist on a second run, ModelHyVid.handle_nd_tensor raises RuntimeError.
-# We pre-empt the whole issue by folding >4D tensors before convert.py runs,
-# but we also clean these stale files just in case.
-# Every arch that may produce a fix_5d_tensors_*.safetensors via convert.py.
-# Keep this in sync with ComfyUI-GGUF/tools/convert.py arch_list.
-KNOWN_ARCH_FIX_FILES = [
-    "hyvid", "wan", "hunyuan", "flux", "sd3", "aura",
-    "ltxv", "hidream", "cosmos", "lumina2", "ernie",
-]
 
 
 class ConversionThread(QThread):
@@ -318,278 +178,25 @@ class ConversionThread(QThread):
         # arg to llama-quantize; e.g. 'Q4_K_M', 'Q8_0', 'F16'.
         self.quant_type = quant_type
 
-    # ── Subprocess helper ─────────────────────────────────────────────────────
-
-    def _stream_command(self, cmd, env):
-        """Run a shell command and stream stdout/stderr line-by-line to the log."""
-        process = subprocess.Popen(
-            cmd, shell=True, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        buffer = ""
-        while True:
-            char = process.stdout.read(1)
-            if not char and process.poll() is not None:
-                break
-            if char in ("\r", "\n"):
-                cleaned = buffer.strip()
-                if cleaned:
-                    self.log_signal.emit(cleaned)
-                buffer = ""
-            else:
-                buffer += char
-        if buffer.strip():
-            self.log_signal.emit(buffer.strip())
-        return process.returncode
-
-    # ── Step 0: Pre-process >4D tensors ──────────────────────────────────────
-
-    def _preprocess_5d_tensors(self):
-        """
-        Loads the source .safetensors and checks every tensor's rank.
-
-        Why this is needed
-        ------------------
-        convert.py's handle_nd_tensor() for HyVid/Wan models saves the
-        offending tensor to fix_5d_tensors_{arch}.safetensors and skips it,
-        so the F16 GGUF ends up missing that tensor entirely. For every other
-        architecture the base-class raises NotImplementedError, aborting
-        conversion outright. Either way, a 5D tensor that reaches
-        llama-quantize causes GGML_ASSERT(n_dims <= GGML_MAX_DIMS) and a
-        core dump.
-
-        The fix: fold any tensor with shape (a, b, c, d, e) → (a*b, c, d, e)
-        here, before convert.py ever sees the file, so handle_nd_tensor is
-        never invoked.
-
-        Returns the path to pass to convert.py (original if nothing was
-        changed, a fixed copy in temp_dir otherwise).
-        """
-        try:
-            import torch  # noqa: F401 – only needed to ensure safetensors dtype support
-            from safetensors.torch import load_file, save_file
-        except ImportError as exc:
-            self.log_signal.emit(f"  [!] torch/safetensors not importable: {exc}")
-            self.log_signal.emit("  [!] Skipping 5D scan. If quantization crashes with")
-            self.log_signal.emit("      GGML_ASSERT(n_dims) check your Python environment.")
-            return self.src
-
-        self.log_signal.emit("  Scanning tensor ranks in source file…")
-        tensors = load_file(self.src)
-
-        # Heads-up about ComfyUI scaled-fp8 quantization. convert.py will
-        # dequantize these in load_state_dict; we only log so the user can see
-        # why the converted output is bf16 rather than fp8.
-        scaled_fp8_weights = [
-            k for k in tensors.keys() if k.endswith(".weight_scale")
-        ]
-        if scaled_fp8_weights:
-            self.log_signal.emit(
-                f"  Detected ComfyUI scaled-fp8 quantization on "
-                f"{len(scaled_fp8_weights)} weight(s); convert.py will dequantize them."
-            )
-
-        over_4d = [k for k, v in tensors.items() if len(v.shape) > 4]
-        if not over_4d:
-            self.log_signal.emit("  ✓ All tensors ≤ 4D — no pre-processing needed.")
-            return self.src
-
-        self.log_signal.emit(f"  Found {len(over_4d)} tensor(s) with >4 dimensions. Folding…")
-
-        fixed = {}
-        for key, tensor in tensors.items():
-            if len(tensor.shape) <= 4:
-                fixed[key] = tensor
-                continue
-            # Fold pairs of leading dims until we reach 4D.
-            # (a, b, c, d, e) → (a*b, c, d, e)
-            t = tensor
-            while len(t.shape) > 4:
-                new_shape = (t.shape[0] * t.shape[1],) + t.shape[2:]
-                t = t.reshape(new_shape)
-            self.log_signal.emit(
-                f"    Folded  {key}  {list(tensor.shape)}  →  {list(t.shape)}"
-            )
-            fixed[key] = t
-
-        base = os.path.basename(self.src).replace(".safetensors", "_5dfixed.safetensors")
-        fixed_src = os.path.join(self.temp_dir, base)
-        save_file(fixed, fixed_src)
-        self.log_signal.emit(f"  Fixed source written: {fixed_src}")
-        return fixed_src
-
-    # ── Main pipeline ─────────────────────────────────────────────────────────
-
-    def _needs_pad_fix(self, f16_path):
-        """Return True iff the F16 GGUF at ``f16_path`` has a 1-D
-        ``x_pad_token`` or ``cap_pad_token``. For all other models
-        ``fix_pad.py`` is a no-op and we skip it to avoid an expensive
-        and occasionally lossy round-trip through GGUFReader/Writer.
-        """
-        try:
-            reader = GGUFReader(f16_path, "r")
-            for t in reader.tensors:
-                if t.name in ("x_pad_token", "cap_pad_token") and len(t.shape) == 1:
-                    return True
-            return False
-        except Exception as exc:
-            # Be safe: if we can't read the file, let fix_pad try.
-            self.log_signal.emit(
-                f"  (could not inspect {f16_path} for pad tokens: {exc}; "
-                f"running fix_pad as a precaution)"
-            )
-            return True
-
     def run(self):
-        filename = os.path.basename(self.src)
+        """Drive the shared pipeline from a QThread.
 
-        my_env = os.environ.copy()
-        # Absolute paths so llama-quantize finds libggml.so / libllama.so
-        # regardless of which directory the GUI was launched from.
-        my_env["LD_LIBRARY_PATH"] = (
-            LD_PATH_BUILD_SRC + os.pathsep
-            + LD_PATH_BUILD_GGML_SRC + os.pathsep
-            + my_env.get("LD_LIBRARY_PATH", "")
-        )
-        # macOS uses DYLD_LIBRARY_PATH; set both so the same code path works.
-        my_env["DYLD_LIBRARY_PATH"] = (
-            LD_PATH_BUILD_SRC + os.pathsep
-            + LD_PATH_BUILD_GGML_SRC + os.pathsep
-            + my_env.get("DYLD_LIBRARY_PATH", "")
-        )
-
-        # Paths are always derived from the *original* filename so that the
-        # F16 cache remains valid across runs even when a fixed-source copy
-        # was created.
-        f16_tmp   = os.path.join(self.temp_dir, filename + "_f16.gguf")
-        fixed_tmp = os.path.join(self.temp_dir, filename + "_f16_fixed.gguf")
-        final_out = os.path.join(
-            self.out_dir,
-            filename.replace(".safetensors", f"_{self.quant_type}.gguf"),
-        )
-
+        Delegates to ``pipeline_lib.run_pipeline`` so the GUI and the
+        headless ``tools/gguf_pipeline.py`` CLI share one orchestration
+        code path (Step 0 5-D pre-fold, Step 2 pad-fix-skip heuristic,
+        Step 3 llama-quantize, Step 4 5-D re-attach for HyVid / Wan).
+        """
         try:
-            # ── Step 0: Fold >4D tensors before conversion ────────────────
-            self.log_signal.emit("=== Step 0: High-dimensional tensor check ===")
-            src_for_convert = self._preprocess_5d_tensors()
-
-            # Remove any stale fix files left by a previous convert.py run.
-            # ModelHyVid.handle_nd_tensor raises RuntimeError if the file
-            # already exists, which would abort Step 1 on a re-run.
-            for arch in KNOWN_ARCH_FIX_FILES:
-                stale = f"./fix_5d_tensors_{arch}.safetensors"
-                if os.path.exists(stale):
-                    os.remove(stale)
-                    self.log_signal.emit(f"  Removed stale fix file: {stale}")
-
-            # ── Step 1: Convert to F16 GGUF ───────────────────────────────
-            skip_convert = False
-            if os.path.exists(f16_tmp):
-                self.log_signal.emit(f"\n=== Step 1: Verifying cached F16 file ===")
-                self.log_signal.emit(f"  Found: {f16_tmp}")
-                try:
-                    reader = GGUFReader(f16_tmp, "r")
-                    if len(reader.tensors) > 0:
-                        self.log_signal.emit(
-                            f"  ✓ Valid ({len(reader.tensors)} tensors). Skipping conversion."
-                        )
-                        skip_convert = True
-                    else:
-                        self.log_signal.emit("  ✗ Empty tensor list — treating as corrupt. Reconverting.")
-                except Exception as exc:
-                    self.log_signal.emit(f"  ✗ Cannot read file ({exc}). Reconverting.")
-
-            if not skip_convert:
-                self.log_signal.emit("\n=== Step 1: Converting to F16 GGUF ===")
-                if self.dtype_reason:
-                    self.log_signal.emit(f"  {self.dtype_reason}")
-                dtype_arg = (
-                    "" if self.dtype_cli == "auto"
-                    else f" --dtype {self.dtype_cli}"
-                )
-                cmd = (
-                    f"{_shell_quote(sys.executable)} {_shell_quote(CONVERT_PY)} "
-                    f"--src {_shell_quote(src_for_convert)} "
-                    f"--dst {_shell_quote(f16_tmp)}{dtype_arg}"
-                )
-                if self._stream_command(cmd, my_env) != 0:
-                    raise RuntimeError("F16 conversion failed. See log above.")
-
-            # ── Step 2: Padding shape fix ─────────────────────────────────
-            # The fix only does anything for Z-Image / Lumina2 models whose
-            # ``x_pad_token`` / ``cap_pad_token`` arrived as 1-D tensors.
-            # Newer Z-Image checkpoints (e.g. Z-Image 0.36 non-Turbo) already
-            # ship them as ``[1, dim]`` -- we skip the rewrite in that case
-            # to avoid an unnecessary 10+ GiB round-trip through GGUF and
-            # the rare "size = 0.000 MB" corruption that triggered the
-            # llama-quantize ``basic_ios::clear: iostream error``.
-            self.log_signal.emit("\n=== Step 2: Applying padding shape fix ===")
-            needs_fix = self._needs_pad_fix(f16_tmp)
-            if needs_fix:
-                cmd = (
-                    f"{_shell_quote(sys.executable)} {_shell_quote(FIX_PAD_PY)} "
-                    f"{_shell_quote(f16_tmp)}"
-                )
-                if self._stream_command(cmd, my_env) != 0:
-                    raise RuntimeError("fix_pad.py failed. See log above.")
-                quantize_input = fixed_tmp
-            else:
-                self.log_signal.emit(
-                    "  No 1-D pad tokens detected -- skipping fix_pad.py. "
-                    "Quantizing the F16 file directly."
-                )
-                quantize_input = f16_tmp
-
-            # ── Step 3: Quantize to user-selected type ────────────────────
-            self.log_signal.emit(
-                f"\n=== Step 3: Quantizing to {self.quant_type} ==="
+            final_out = _pipeline_run(
+                src=self.src,
+                temp_dir=self.temp_dir,
+                out_dir=self.out_dir,
+                quant_type=self.quant_type,
+                dtype_cli=self.dtype_cli,
+                dtype_reason=self.dtype_reason,
+                log=self.log_signal.emit,
             )
-            quantize_bin, quantize_err = locate_llama_quantize()
-            if quantize_err:
-                raise RuntimeError(quantize_err)
-            cmd = (
-                f"{_shell_quote(quantize_bin)} "
-                f"{_shell_quote(quantize_input)} {_shell_quote(final_out)} "
-                f"{self.quant_type}"
-            )
-            if self._stream_command(cmd, my_env) != 0:
-                raise RuntimeError(
-                    "llama-quantize failed.\n\n"
-                    "If the log shows  GGML_ASSERT(n_dims >= 1 && n_dims <= GGML_MAX_DIMS):\n"
-                    "  A tensor with >4 dimensions reached the quantizer via the cached F16\n"
-                    "  file (built before this fix was in place).\n\n"
-                    "  Solution: delete the stale .gguf files from your temp folder\n"
-                    "  and run again. Step 0 will fold those tensors before Step 1 runs."
-                )
-
-            # ── Step 4: Cleanup ───────────────────────────────────────────
-            self.log_signal.emit("\n=== Step 4: Cleaning up temp files ===")
-            for tmp in [f16_tmp, fixed_tmp]:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                    self.log_signal.emit(f"  Removed: {tmp}")
-
-            # Also remove the _5dfixed.safetensors we may have created.
-            fixed_src_path = os.path.join(
-                self.temp_dir,
-                filename.replace(".safetensors", "_5dfixed.safetensors"),
-            )
-            if os.path.exists(fixed_src_path):
-                os.remove(fixed_src_path)
-                self.log_signal.emit(f"  Removed: {fixed_src_path}")
-
-            # ── Verify output ─────────────────────────────────────────────
-            try:
-                reader = GGUFReader(final_out)
-                self.log_signal.emit(
-                    f"\n✓ Output verified: {len(reader.tensors)} tensors written successfully."
-                )
-            except Exception as exc:
-                self.log_signal.emit(f"\n⚠ Output verification warning: {exc}")
-
             self.finished_signal.emit(True, f"Done!\nOutput: {final_out}")
-
         except Exception as exc:
             self.finished_signal.emit(False, str(exc))
 

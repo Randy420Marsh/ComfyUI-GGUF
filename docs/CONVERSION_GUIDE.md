@@ -40,19 +40,22 @@ with `gguf`, `safetensors`, `torch`, `numpy`, `tqdm`, and optionally
 
 ## Two ways to drive the pipeline
 
-| | GUI (`tools/gguf_gui.py`) | CLI |
-|---|---|---|
-| Setup steps | Read [`tools/README.md`](../tools/README.md#setup) | Read [`tools/README.md`](../tools/README.md#setup) |
-| Per-conversion clicks/keys | ~6 clicks | ~3 commands |
-| GPU auto-detect (bf16 vs f16) | Yes (`Auto` dtype mode) | No — pass `--dtype fp16` on Turing |
-| Quant picker UI | Yes (dropdown of all 30+ output types) | Pass the type name to `llama-quantize` |
-| Model-aware quant recommendation | Yes (**Analyze** button) | Run `python tools/analyze_model.py <path> <vram_gb>` |
-| Subprocess for `llama-quantize` | Spawned automatically | You invoke it yourself |
-| `LD_LIBRARY_PATH` requirement | Inherits from the launching shell | You export it before running |
-| Scriptable / CI-friendly | No | Yes |
-| Recommended for | One-off conversions, beginners | Batch jobs, scripting, headless servers |
+| | GUI (`tools/gguf_gui.py`) | CLI (`tools/gguf_pipeline.py`) | CLI (per-step) |
+|---|---|---|---|
+| Setup steps | Read [`tools/README.md`](../tools/README.md#setup) | Read [`tools/README.md`](../tools/README.md#setup) | Read [`tools/README.md`](../tools/README.md#setup) |
+| Per-conversion clicks/keys | ~6 clicks | 1 command | ~3 commands |
+| GPU auto-detect (bf16 vs f16) | Yes (`Auto` dtype mode) | No — pass `--dtype fp16` on Turing | No — pass `--dtype fp16` on Turing |
+| Quant picker UI | Yes (dropdown of all 30+ output types) | `--quant TYPE` flag (all 39 types) | Pass the type name to `llama-quantize` |
+| Model-aware quant recommendation | Yes (**Analyze** button) | Run `python tools/analyze_model.py` separately | Run `python tools/analyze_model.py` separately |
+| Subprocess for `llama-quantize` | Spawned automatically | Spawned automatically | You invoke it yourself |
+| `LD_LIBRARY_PATH` requirement | Auto-set | Auto-set | You export it before running |
+| Pre-flight `llama-quantize` check | Yes | Yes | No — manual |
+| Z-Image Step-2 skip when pad tokens already 2-D | Yes | Yes | Run `fix_pad.py` yourself |
+| 5-D pre-fold (HyVid / Wan) | Yes | Yes | No — manual `fix_5d_tensors.py` after Phase C |
+| Scriptable / CI-friendly | No | Yes | Yes |
+| Recommended for | One-off conversions, beginners | Batch jobs, scripting, headless servers | Power users who want to inspect each intermediate |
 
-The two paths produce **identical** output GGUFs — the GUI is a wrapper around exactly the same `convert.py` + `llama-quantize` invocations.
+All three paths produce **identical** output GGUFs. The GUI and `gguf_pipeline.py` share their orchestration code via [`tools/pipeline_lib.py`](../tools/pipeline_lib.py) so feature additions land on both at once. The per-step CLI tools (`convert.py`, `fix_pad.py`, `fix_5d_tensors.py`) still exist for users who want manual control.
 
 ---
 
@@ -75,8 +78,19 @@ The GUI persists your dtype / quant selections to `settings.json` between launch
 
 ### CLI
 
+For most users on the CLI, the right entry point is the one-shot `gguf_pipeline.py` — it runs all of Phase A + B + C (and Phase C+ for HyVid / Wan) in a single command, shares its orchestration code with the GUI, and applies the same pre-flight `llama-quantize` check before doing any expensive work:
+
 ```bash
 source .venv-convert/bin/activate
+python tools/gguf_pipeline.py \
+  --src /path/to/model.safetensors \
+  --dst-dir /path/to/out \
+  --quant Q4_K_M           # any of 39 supported types; see --help
+```
+
+You can keep using the per-step CLI tools below if you want to inspect each intermediate (e.g. running `inspect_gguf.py --check-sizes` on the `_f16.gguf` before quantizing).
+
+```bash
 python tools/convert.py --src /path/to/model.safetensors
 ```
 
