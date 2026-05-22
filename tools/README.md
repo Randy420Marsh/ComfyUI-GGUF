@@ -81,23 +81,41 @@ The conversion tooling, the Qt GUI front-end (`gguf_gui.py`), `requirements-conv
 
 ### 2. Create a conversion virtualenv and install dependencies
 
+The recommended toolchain is [`uv`](https://docs.astral.sh/uv/) — `uv venv` + `uv pip install` is much faster than `python -m venv` + `pip install`, and `uv` picks the right interpreter on its own. Install it once if you haven't already (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+
 ```bash
-# Linux / macOS
-python -m venv .venv-convert
-source .venv-convert/bin/activate
+# Linux / macOS (uv, recommended)
+uv venv venv --python 3.11
+source venv/bin/activate
+uv pip install -r tools/requirements-conversion.txt
+```
+
+```bat
+:: Windows (uv, recommended)
+uv venv venv --python 3.11
+venv\Scripts\activate.bat
+uv pip install -r tools\requirements-conversion.txt
+```
+
+Plain `pip` works fine too if you'd rather not install `uv`:
+
+```bash
+# Linux / macOS (pip)
+python -m venv venv
+source venv/bin/activate
 pip install -U pip
 pip install -r tools/requirements-conversion.txt
 ```
 
 ```bat
-:: Windows
-python -m venv .venv-convert
-.venv-convert\Scripts\activate.bat
+:: Windows (pip)
+python -m venv venv
+venv\Scripts\activate.bat
 pip install -U pip
 pip install -r tools\requirements-conversion.txt
 ```
 
-The `requirements-conversion.txt` file lists minimum versions; newer is fine. `torch` is required even on CPU-only conversion machines because `convert.py` uses it for the actual tensor work; install whichever build matches your platform (the CPU wheel from PyPI is sufficient for conversion).
+The `requirements-conversion.txt` file lists minimum versions; newer is fine. `torch` is required even on CPU-only conversion machines because `convert.py` uses it for the actual tensor work; install whichever build matches your platform (the CPU wheel from PyPI is sufficient for conversion). A recently validated combination is `Python 3.11 + uv + torch 2.12 + safetensors 0.7 + numpy 2.4 + gguf 0.19 + PySide6 6.11` on Ubuntu with CUDA 13; older floors all the way back to torch 2.1 / numpy 1.24 still work.
 
 > **Why a separate venv?** The root-level `requirements.txt` / `pyproject.toml` only list what the **custom node** needs at inference time (`gguf` + tokenizer extras). Those install into ComfyUI's environment. The conversion tools have a different dependency surface (torch, safetensors, gguf, Qt for the GUI) and shouldn't pollute the inference env.
 
@@ -149,17 +167,19 @@ After the build, the binary lives at:
 - Linux / macOS: `llama.cpp/build/bin/llama-quantize`
 - Windows: `llama.cpp\build\bin\Release\llama-quantize.exe` (or `Debug\` if you used `--config Debug`)
 
-### 4. (Linux only) Export `LD_LIBRARY_PATH`
+### 4. (Linux only) Export `LD_LIBRARY_PATH` (CLI usage only)
 
 The patched `llama-quantize` build links against the shared `ggml` libraries inside the `llama.cpp/build/` tree, not against any system-installed `libggml`. If you run it from a different working directory and the runtime loader can't find those `.so` files, the binary will fail with `error while loading shared libraries: libggml.so: cannot open shared object file`.
 
-Export the path before invoking `llama-quantize` (and before launching `gguf_gui.py`, which spawns it as a subprocess):
+**This step is only required for direct CLI invocations of `llama-quantize`.** The GUI (`gguf_gui.py`) computes `LD_LIBRARY_PATH` automatically from `LLAMA_CPP_DIR` (default: `<repo>/llama.cpp`) for the conversion subprocess, so you don't need to export anything for the GUI workflow.
+
+For CLI usage, export the path before invoking `llama-quantize`:
 
 ```bash
 export LD_LIBRARY_PATH=./llama.cpp/build/src:./llama.cpp/build/ggml/src:$LD_LIBRARY_PATH
 ```
 
-Make this persistent by appending the line to your `~/.bashrc` / `~/.zshrc`, or set it inside whatever launcher you use to start the GUI. The `./` prefixes assume your working directory is the root of this repo when you run the conversion — adjust to absolute paths if you call it from elsewhere (e.g. `export LD_LIBRARY_PATH=/path/to/ComfyUI-GGUF/llama.cpp/build/src:/path/to/ComfyUI-GGUF/llama.cpp/build/ggml/src:$LD_LIBRARY_PATH`).
+Make this persistent by appending the line to your `~/.bashrc` / `~/.zshrc`. The `./` prefixes assume your working directory is the root of this repo when you run the conversion — adjust to absolute paths if you call it from elsewhere (e.g. `export LD_LIBRARY_PATH=/path/to/ComfyUI-GGUF/llama.cpp/build/src:/path/to/ComfyUI-GGUF/llama.cpp/build/ggml/src:$LD_LIBRARY_PATH`).
 
 macOS uses `DYLD_LIBRARY_PATH` instead of `LD_LIBRARY_PATH`. Windows doesn't need any equivalent — the loader picks up DLLs from `llama.cpp\build\bin\Release\` automatically.
 
@@ -172,9 +192,25 @@ There are two ways to drive the pipeline: the GUI (recommended for most users) a
 ### Option A — GUI (`gguf_gui.py`)
 
 ```bash
-source .venv-convert/bin/activate
+source venv/bin/activate
 python tools/gguf_gui.py
 ```
+
+The GUI resolves `convert.py`, `fix_pad.py`, and the patched `llama-quantize` binary from its own location (and from `<repo>/llama.cpp/build/`), so you can launch it from any working directory — either from the repo root as shown above, or directly from inside `tools/`:
+
+```bash
+cd tools
+python gguf_gui.py
+```
+
+If your `llama.cpp` clone lives somewhere other than `<repo>/llama.cpp`, point the GUI at it explicitly:
+
+```bash
+export LLAMA_CPP_DIR=/path/to/llama.cpp
+python tools/gguf_gui.py
+```
+
+`LD_LIBRARY_PATH` is set automatically based on `LLAMA_CPP_DIR`, so step 4 of [Setup](#4-linux-only-export-ld_library_path) is only needed when running `llama-quantize` directly on the CLI.
 
 The GUI handles convert → fix → quantize → inspect end-to-end. Key controls:
 
