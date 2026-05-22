@@ -6,7 +6,7 @@ license = { file = "LICENSE" }
 dependencies = ["gguf>=0.13.0", "sentencepiece", "protobuf"]
 
 [project.urls]
-Repository = "https://github.com/city96/ComfyUI-GGUF"
+Repository = "https://github.com/Randy420Marsh/ComfyUI-GGUF"
 
 [tool.comfy]
 PublisherId = "city96"

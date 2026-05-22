@@ -1,7 +1,19 @@
-# ComfyUI-GGUF
+# ComfyUI-GGUF (Randy420Marsh fork)
 GGUF Quantization support for native ComfyUI models
 
-This is currently very much WIP. These custom nodes provide support for model files stored in the GGUF format popularized by [llama.cpp](https://github.com/ggerganov/llama.cpp).
+This is a fork of [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) with additional architecture support and conversion tooling that is not present upstream. Highlights specific to this fork:
+
+- Text-encoder GGUF support for `mistral3` (Ministral-3-3B, used by ERNIE-Image), plus `Mistral`-family `tekken` tokenizer reconstruction from GGUF metadata.
+- Gemma-4 text-encoder loading via `tokenizer.json` sidecar (fixes the `'str' object has no attribute 'decode'` crash you get with the upstream loader).
+- Optional `mmproj_name` picker on `CLIPLoader (GGUF)` for explicit multimodal-projector selection when filename auto-discovery cannot match it.
+- `tools/convert.py` extended to support ERNIE-Image and ComfyUI scaled-fp8 dequantization.
+- `tools/gguf_gui.py` — a Qt GUI front-end for `convert.py` with bf16 auto-detection, a full `llama-quantize` output-type selector, and an **Analyze** button that picks a quant target from the model's metadata.
+- `tools/inspect_gguf.py --metadata` for inspecting per-architecture GGUF metadata (replaces a safetensors-only script that does not work on GGUF).
+- `docs/CONVERSION_GUIDE.md` — long-form per-model walkthrough.
+
+Use this repo's URL when installing, cloning the tools, or filing bug reports about the fork-specific features. Issues that exist in the upstream loader (everything outside the bullets above) should be reported to [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF/issues) where the original author can triage them.
+
+These custom nodes provide support for model files stored in the GGUF format popularized by [llama.cpp](https://github.com/ggerganov/llama.cpp).
 
 While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
 
@@ -17,17 +29,17 @@ Note: The "Force/Set CLIP Device" is **NOT** part of this node pack. Do not inst
 To install the custom node normally, git clone this repository into your custom nodes folder (`ComfyUI/custom_nodes`) and install the only dependency for inference (`pip install --upgrade gguf`)
 
 ```
-git clone https://github.com/city96/ComfyUI-GGUF
+git clone https://github.com/Randy420Marsh/ComfyUI-GGUF
 ```
 
 To install the custom node on a standalone ComfyUI release, open a CMD inside the "ComfyUI_windows_portable" folder (where your `run_nvidia_gpu.bat` file is) and use the following commands:
 
 ```
-git clone https://github.com/city96/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
+git clone https://github.com/Randy420Marsh/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
 .\python_embeded\python.exe -s -m pip install -r .\ComfyUI\custom_nodes\ComfyUI-GGUF\requirements.txt
 ```
 
-On MacOS sequoia, torch 2.4.1 seems to be required, as 2.6.X nightly versions cause a "M1 buffer is not large enough" error. See [this issue](https://github.com/city96/ComfyUI-GGUF/issues/107) for more information/workarounds.
+On MacOS sequoia, torch 2.4.1 seems to be required, as 2.6.X nightly versions cause a "M1 buffer is not large enough" error. See [this upstream issue](https://github.com/city96/ComfyUI-GGUF/issues/107) for more information/workarounds.
 
 ## Usage
 
@@ -46,4 +58,4 @@ Initial support for quantizing T5 has also been added recently, these can be use
 
 - [t5_v1.1-xxl GGUF](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
 
-See the instructions in the [tools](https://github.com/city96/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants.
+See the instructions in the [tools](https://github.com/Randy420Marsh/ComfyUI-GGUF/tree/main/tools) folder for how to create your own quants. Long-form per-model walkthroughs (Flux, SD3.5, ERNIE-Image, Lumina/Gemma, Wan/Hunyuan-Video, etc.) live in [`docs/CONVERSION_GUIDE.md`](https://github.com/Randy420Marsh/ComfyUI-GGUF/blob/main/docs/CONVERSION_GUIDE.md).
