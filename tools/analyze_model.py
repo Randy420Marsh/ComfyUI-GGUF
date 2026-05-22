@@ -219,7 +219,18 @@ def read_gguf_tensors(path: str) -> tuple[list["TensorInfo"], int]:
     reader = _gguf.GGUFReader(path, "r")
     out: list[TensorInfo] = []
     for t in reader.tensors:
-        shape = tuple(int(d) for d in t.shape)
+        # GGUF stores dims in reversed on-disk order: GGUFWriter packs
+        # ``ti.shape[n_dims - 1 - j]`` and GGUFReader leaves ``.shape``
+        # in that reversed form (only ``.data`` gets reshaped to numpy
+        # order via ``np_dims = tuple(reversed(dims.tolist()))``).
+        # Reverse here so downstream consumers (``extract_dims``, the
+        # weight-cost loop, the activation cost estimator) see the same
+        # torch/safetensors convention they get from the safetensors
+        # reader path. Without this, e.g. a 4-D patch-embedding conv
+        # (out_channels, in_channels, kh, kw) arrives as (kw, kh,
+        # in_channels, out_channels) and ``extract_dims`` reads
+        # ``hidden_dim = kw`` instead of ``out_channels``.
+        shape = tuple(int(d) for d in reversed(t.shape))
         nelem = 1
         for d in shape:
             nelem *= d
