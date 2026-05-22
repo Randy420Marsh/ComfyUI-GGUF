@@ -69,6 +69,46 @@ LD_PATH_BUILD_SRC = os.path.join(LLAMA_CPP_DIR, "build", "src")
 LD_PATH_BUILD_GGML_SRC = os.path.join(LLAMA_CPP_DIR, "build", "ggml", "src")
 
 
+def locate_llama_quantize():
+    """Return ``(bin_path, error_or_None)`` for the patched llama-quantize.
+
+    Tries the Windows Release path first on Windows, then the POSIX path
+    on every platform. Returns the *expected* path even on miss so the
+    error message can quote it back to the user.
+
+    Used by ``start_workflow`` for the pre-flight check and by
+    ``ConversionThread.run`` defensively in case the binary disappears
+    between the pre-flight and Step 3 (e.g. user rebuilds llama.cpp in
+    a separate shell mid-conversion).
+    """
+    if os.name == "nt" and os.path.exists(LLAMA_QUANTIZE_BIN_WIN):
+        return LLAMA_QUANTIZE_BIN_WIN, None
+    if os.path.exists(LLAMA_QUANTIZE_BIN):
+        return LLAMA_QUANTIZE_BIN, None
+    expected = (
+        LLAMA_QUANTIZE_BIN_WIN if os.name == "nt" else LLAMA_QUANTIZE_BIN
+    )
+    override_msg = (
+        f"$LLAMA_CPP_DIR override active -> {LLAMA_CPP_DIR!r}\n"
+        if os.environ.get("LLAMA_CPP_DIR")
+        else (
+            "Expected layout: <ComfyUI-GGUF repo root>/llama.cpp/build/bin/llama-quantize\n"
+            "(set $LLAMA_CPP_DIR to override if llama.cpp lives elsewhere).\n"
+        )
+    )
+    err = (
+        f"llama-quantize binary not found at {expected}.\n"
+        f"{override_msg}"
+        "Build it first: see tools/README.md \u00a7 3 or the wiki page\n"
+        "Build-llama-quantize. The shortcut is:\n"
+        "  git clone -b city96 https://github.com/Randy420Marsh/llama.cpp.git\n"
+        "  cd llama.cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release \\\n"
+        "    -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON\n"
+        "  cmake --build build --config Release -j --target llama-quantize\n"
+    )
+    return expected, err
+
+
 def _shell_quote(path):
     """Quote a path for safe interpolation into a shell command string.
 
@@ -505,18 +545,9 @@ class ConversionThread(QThread):
             self.log_signal.emit(
                 f"\n=== Step 3: Quantizing to {self.quant_type} ==="
             )
-            quantize_bin = (
-                LLAMA_QUANTIZE_BIN_WIN
-                if os.name == "nt" and os.path.exists(LLAMA_QUANTIZE_BIN_WIN)
-                else LLAMA_QUANTIZE_BIN
-            )
-            if not os.path.exists(quantize_bin):
-                raise RuntimeError(
-                    f"llama-quantize binary not found at {quantize_bin}.\n"
-                    "Build it first (see tools/README.md \u00a7 3), or set the\n"
-                    "LLAMA_CPP_DIR environment variable to the root of your\n"
-                    "llama.cpp clone."
-                )
+            quantize_bin, quantize_err = locate_llama_quantize()
+            if quantize_err:
+                raise RuntimeError(quantize_err)
             cmd = (
                 f"{_shell_quote(quantize_bin)} "
                 f"{_shell_quote(quantize_input)} {_shell_quote(final_out)} "
@@ -826,6 +857,20 @@ class MainWindow(QMainWindow):
             return
         if not os.path.exists(src):
             self.log_area.appendPlainText(f"Error: source file not found:\n  {src}")
+            return
+
+        # Pre-flight: confirm the patched llama-quantize exists before we
+        # spend 30+ seconds writing a 12+ GiB intermediate F16 GGUF only to
+        # fail at Step 3 because the build is missing.
+        _quant_bin, _quant_err = locate_llama_quantize()
+        if _quant_err:
+            self.log_area.clear()
+            self.log_area.appendPlainText(
+                "=== Pre-flight check failed ===\n\n" + _quant_err
+            )
+            QMessageBox.critical(
+                self, "llama-quantize not found", _quant_err,
+            )
             return
 
         self.log_area.clear()
