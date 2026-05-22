@@ -7,6 +7,10 @@ reference doc for the conversion tools themselves.
 If you've never set up the conversion pipeline before, do
 [`tools/README.md` Phases 1–4](../tools/README.md#setup) first
 (venv, dependencies, `lcpp.patch` + `b3962`, `LD_LIBRARY_PATH`).
+The wiki page [Build the patched llama-quantize](https://github.com/Randy420Marsh/ComfyUI-GGUF/wiki/Build-llama-quantize)
+covers the shortcut version that uses the pre-patched
+[`Randy420Marsh/llama.cpp` `city96` branch](https://github.com/Randy420Marsh/llama.cpp/tree/city96)
+(no `git apply` step required, no CRLF normalisation).
 This guide assumes you already have a working `llama-quantize` binary
 at `llama.cpp/build/bin/llama-quantize` and a `.venv-convert/` venv
 with `gguf`, `safetensors`, `torch`, `numpy`, `tqdm`, and optionally
