@@ -1,10 +1,18 @@
-"""On-the-fly analyzer for diffusion safetensors checkpoints.
+"""On-the-fly analyzer for diffusion checkpoints.
 
-Reads the safetensors JSON header (no weight load), detects the model
+Reads a model's tensor index without loading any weights, detects the
 architecture via the same `keys_detect` tuples used by `convert.py`,
 extracts model-derived hyperparameters (hidden_dim, depth, patch_size),
 and computes a *live* quant -> VRAM matrix against the user's
 detected GPU.
+
+Supports two on-disk formats:
+  - `.safetensors` -- parses the JSON header at offset 8.
+  - `.gguf` (any architecture) -- uses `gguf.GGUFReader` to walk the
+    tensor index. Useful when the user wants to re-evaluate a quant
+    decision against an already-converted intermediate or final GGUF
+    (e.g. compare the city96 pre-quantized Z-Image Turbo to a fresh
+    Z-Image 0.36 F16 conversion).
 
 Nothing in this module is hardcoded per architecture or per model: the
 weight cost is summed over the actual tensors in the file under
@@ -158,6 +166,9 @@ class AnalysisResult:
 # ── safetensors header reader ───────────────────────────────────────────────
 
 
+GGUF_MAGIC = b"GGUF"
+
+
 def read_safetensors_header(path: str) -> tuple[dict, int]:
     """Return (header_dict, file_size). Reads only the 8-byte length + JSON
     header; does NOT touch tensor data."""
@@ -173,6 +184,69 @@ def read_safetensors_header(path: str) -> tuple[dict, int]:
         if len(hdr) != hdr_len:
             raise ValueError("safetensors header truncated")
     return json.loads(hdr.decode("utf-8")), file_size
+
+
+def _detect_format(path: str) -> str:
+    """Return ``"gguf"`` or ``"safetensors"`` for ``path``.
+
+    Prefers the 4-byte magic over the extension so a misnamed file still
+    routes correctly. Raises ValueError when neither matches.
+    """
+    with open(path, "rb") as f:
+        magic = f.read(4)
+    if magic == GGUF_MAGIC:
+        return "gguf"
+    # safetensors has no magic; fall back to the extension and let the
+    # downstream parser raise a precise error if that's wrong too.
+    if path.lower().endswith(".gguf"):
+        return "gguf"
+    if path.lower().endswith(".safetensors"):
+        return "safetensors"
+    # Last-chance guess: try parsing the safetensors header length.
+    return "safetensors"
+
+
+def read_gguf_tensors(path: str) -> tuple[list["TensorInfo"], int]:
+    """Return (tensors, file_size) by walking a GGUF tensor index.
+
+    Uses ``gguf.GGUFReader`` (already a hard dep of this repo) so the
+    parser stays in lock-step with the format version that ``convert.py``
+    and ``fix_pad.py`` emit. Imports are local to keep the safetensors-
+    only path free of the gguf import cost.
+    """
+    import gguf as _gguf  # local import: hot path for the safetensors case
+    file_size = os.path.getsize(path)
+    reader = _gguf.GGUFReader(path, "r")
+    out: list[TensorInfo] = []
+    for t in reader.tensors:
+        shape = tuple(int(d) for d in t.shape)
+        nelem = 1
+        for d in shape:
+            nelem *= d
+        # ``t.tensor_type`` is a ``GGMLQuantizationType`` enum; ``.name``
+        # already matches our BITS_PER_WEIGHT keys ("F16", "BF16", "Q4_K",
+        # "F32", …) for everything we need to render the histogram.
+        dtype_name = t.tensor_type.name
+        out.append(TensorInfo(
+            name=t.name,
+            dtype=dtype_name,
+            shape=shape,
+            n_params=nelem,
+        ))
+    return out, file_size
+
+
+def read_model_tensors(path: str) -> tuple[list["TensorInfo"], int]:
+    """Format-agnostic helper. Returns ``(tensors, file_size)``.
+
+    Routes to ``read_safetensors_header`` + ``tensors_from_header`` or
+    to ``read_gguf_tensors`` based on the file magic / extension.
+    """
+    fmt = _detect_format(path)
+    if fmt == "gguf":
+        return read_gguf_tensors(path)
+    hdr, file_size = read_safetensors_header(path)
+    return tensors_from_header(hdr), file_size
 
 
 def tensors_from_header(hdr: dict) -> list[TensorInfo]:
@@ -419,8 +493,7 @@ def analyze(path: str,
         reverse=True,
     )
 
-    hdr, file_size = read_safetensors_header(path)
-    tensors = tensors_from_header(hdr)
+    tensors, file_size = read_model_tensors(path)
     keys = {t.name for t in tensors}
 
     arch, klass, invalid = detect_arch(keys)
