@@ -30,8 +30,8 @@ page using the pre-patched
 | `convert.py` | Convert a `.safetensors` UNET / DiT into a `BF16` or `F16` GGUF. |
 | `gguf_gui.py` | Qt GUI that wraps `convert.py` + `llama-quantize` + the inspect/fix helpers, with GPU auto-detection, dtype mode, quant selector, and an Analyze button. |
 | `analyze_model.py` | Library used by the Analyze button (also runnable from the CLI). Reads a safetensors header and produces a per-quant VRAM table — see [Analyze](#analyze-pick-a-quant-from-the-model-and-your-gpu). |
-| `inspect_gguf.py` | Print arch / file type / per-tensor dtype histogram of an existing GGUF. Has `--check-no-bf16` for CI / scripting and `--metadata` for the full KV section. |
-| `fix_pad.py` | Patch the 1-D padding tensors on Z-Image / Lumina2 GGUFs so `llama-quantize` doesn't choke on them. **Run between `convert.py` and `llama-quantize` for those models, not after.** |
+| `inspect_gguf.py` | Print arch / file type / per-tensor dtype histogram of an existing GGUF. Has `--check-no-bf16` for CI / scripting, `--check-sizes` for catching zero-byte / corrupt tensors that crash `llama-quantize` with `basic_ios::clear: iostream error`, and `--metadata` for the full KV section. |
+| `fix_pad.py` | Reshape 1-D `x_pad_token` / `cap_pad_token` to `[1, dim]` on Z-Image / Lumina2 GGUFs so `llama-quantize` doesn't choke on them. Auto-detects no-op cases (Z-Image 0.36 non-Turbo and similar checkpoints already ship 2-D pad tokens) and fast-copies the file unchanged in those cases. **Run between `convert.py` and `llama-quantize` for those models, not after.** |
 | `fix_5d_tensors.py` | Re-attach the 5D tensors that `convert.py` strips from Hunyuan Video / Wan 2.1 GGUFs. Run **after** `llama-quantize`. |
 | `read_tensors.py` | Dump tensor shapes / dtypes from a `.safetensors` file. Debugging helper. |
 | `fix_lines_ending.py` | One-shot CRLF → LF conversion of `lcpp.patch` for users whose Git rewrote line endings on clone. |
@@ -298,7 +298,14 @@ python tools/fix_pad.py /path/to/zimage-F16.gguf
 # -> writes /path/to/zimage-F16_fixed.gguf
 ```
 
-Skipping this step on a Z-Image / Lumina2 model will cause `llama-quantize` to fail or produce a model that generates severe noise.
+Behaviour:
+
+- **1-D pad tokens present** (Z-Image Turbo legacy, RedCraft ZiB) → reshapes them to `[1, dim]` and rewrites the GGUF.
+- **Pad tokens already 2-D** (e.g. Z-Image 0.36 non-Turbo from [`OmegaShred/Z-Image-0.36`](https://huggingface.co/OmegaShred/Z-Image-0.36)) → prints `No 1-D pad tokens found -- nothing to fix.` and copies the file unchanged. Safe to leave in the pipeline.
+
+The GUI skips this step entirely when no fix is needed, feeding the F16 GGUF directly to `llama-quantize`.
+
+Skipping this step on a Z-Image Turbo (pre-2-D) model will cause `llama-quantize` to fail or produce a model that generates severe noise.
 
 #### Fix 5D tensors (Hunyuan Video / Wan 2.1)
 
@@ -321,6 +328,7 @@ python tools/inspect_gguf.py /path/to/model.gguf
 Prints arch + file type + per-tensor dtype histogram. Useful flags:
 
 - `--check-no-bf16` — exits non-zero (rc=2) if any `BF16` tensor sneaked in. Drop this into CI when you specifically need an F16-only GGUF (Turing target).
+- `--check-sizes` — exits non-zero (rc=3) if any tensor in the GGUF has zero bytes or a stored size that doesn't match `prod(shape) * dtype-size`. Run this on `_f16.gguf` (and `_f16_fixed.gguf`) when `llama-quantize` crashes mid-tensor with `basic_ios::clear: iostream error`; the offending tensor is the one in the failure log with `size = 0.000 MB`.
 - `--verbose` — full per-tensor table (`name`, `shape`, `dtype`).
 - `--metadata` — dump the KV section (architecture, attention head counts, context length, tokenizer config, etc.). Use this instead of trying to point `safetensors.safe_open` at a GGUF — GGUF and safetensors are different on-disk formats and pointing the safetensors reader at a GGUF gets you `header too large` errors.
 
