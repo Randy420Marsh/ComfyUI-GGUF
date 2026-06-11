@@ -27,7 +27,7 @@ def get_field(reader, field_name, field_type):
     field = reader.get_field(field_name)
     if field is None:
         return None
-    elif field_type == str:
+    elif field_type is str:
         # extra check here as this is used for checking arch string
         if len(field.types) != 1 or field.types[0] != gguf.GGUFValueType.STRING:
             raise TypeError(f"Bad type for GGUF {field_name} key: expected string, got {field.types!r}")
@@ -41,7 +41,7 @@ def get_list_field(reader, field_name, field_type):
     field = reader.get_field(field_name)
     if field is None:
         return None
-    elif field_type == str:
+    elif field_type is str:
         return tuple(str(field.parts[part_idx], encoding="utf-8") for part_idx in field.data)
     elif field_type in [int, float, bool]:
         return tuple(field_type(field.parts[part_idx][0]) for part_idx in field.data)
@@ -63,7 +63,7 @@ def get_gguf_metadata(reader):
                     metadata[field_name] = float(field.parts[field.data[-1]])
                 elif field.types[0] == gguf.GGUFValueType.BOOL:
                     metadata[field_name] = bool(field.parts[field.data[-1]])
-        except:
+        except Exception:
             continue
     return metadata
 
@@ -248,7 +248,8 @@ def sd_map_replace(raw_sd, key_map):
 def llama_permute(raw_sd, n_head, n_head_kv):
     # Reverse version of LlamaModel.permute in llama.cpp convert script
     sd = {}
-    permute = lambda x,h: x.reshape(h, x.shape[0] // h // 2, 2, *x.shape[1:]).swapaxes(1, 2).reshape(x.shape)
+    def permute(x, h):
+        return x.reshape(h, x.shape[0] // h // 2, 2, *x.shape[1:]).swapaxes(1, 2).reshape(x.shape)
     for k,v in raw_sd.items():
         if k.endswith(("q_proj.weight", "q_proj.bias")):
             v.data = permute(v.data, n_head)
