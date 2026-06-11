@@ -244,6 +244,81 @@ class PipelineLibConstantsTests(unittest.TestCase):
         for arch in pipeline_lib.ARCHS_NEEDING_5D_REATTACH:
             self.assertIn(arch, pipeline_lib.KNOWN_ARCH_FIX_FILES)
 
+    def test_known_arch_fix_files_covers_convert_arch_list(self):
+        # The inverse of the subset test: every arch convert.py can emit
+        # must have its potential stale fix file cleaned up by Step 0.
+        from convert import arch_list
+        for cls in arch_list:
+            self.assertIn(cls.arch, pipeline_lib.KNOWN_ARCH_FIX_FILES,
+                          f"convert.py arch {cls.arch!r} missing from"
+                          f" KNOWN_ARCH_FIX_FILES")
+
+
+class InsertNameSuffixTests(unittest.TestCase):
+    """Output naming must only touch the final extension."""
+
+    def test_plain_safetensors(self):
+        self.assertEqual(
+            pipeline_lib.insert_name_suffix("model.safetensors", "_5dfixed"),
+            "model_5dfixed.safetensors",
+        )
+
+    def test_sft_extension_gets_distinct_name(self):
+        # A bare str.replace(".safetensors", ...) would no-op here.
+        self.assertEqual(
+            pipeline_lib.insert_name_suffix("model.sft", "_5dfixed"),
+            "model_5dfixed.sft",
+        )
+
+    def test_double_extension_only_touches_last(self):
+        self.assertEqual(
+            pipeline_lib.insert_name_suffix("model.safetensors_f16.gguf", "_fixed"),
+            "model.safetensors_f16_fixed.gguf",
+        )
+
+    def test_no_extension(self):
+        self.assertEqual(
+            pipeline_lib.insert_name_suffix("model", "_5dfixed"),
+            "model_5dfixed",
+        )
+
+
+class StreamCommandTests(unittest.TestCase):
+    """Subprocess streaming: line splitting, CR handling, return codes."""
+
+    def _run(self, code: str) -> tuple[int, list[str]]:
+        lines = []
+        cmd = (
+            f"{pipeline_lib.shell_quote(sys.executable)} -c "
+            f"{pipeline_lib.shell_quote(code)}"
+        )
+        rc = pipeline_lib.stream_command(cmd, os.environ.copy(), lines.append)
+        return rc, lines
+
+    def test_streams_lines_and_returns_zero(self):
+        rc, lines = self._run("print('alpha'); print('beta')")
+        self.assertEqual(rc, 0)
+        self.assertEqual(lines, ["alpha", "beta"])
+
+    def test_carriage_return_progress_lines_split(self):
+        rc, lines = self._run(r"import sys; sys.stdout.write('10%\r20%\n')")
+        self.assertEqual(rc, 0)
+        self.assertEqual(lines, ["10%", "20%"])
+
+    def test_nonzero_exit_code_propagates(self):
+        rc, _lines = self._run("import sys; sys.exit(3)")
+        self.assertEqual(rc, 3)
+
+    def test_stdout_closed_before_exit_does_not_hang(self):
+        # Child closes stdout, then keeps running briefly: stream_command
+        # must wait for the real exit code instead of spinning or hanging.
+        rc, lines = self._run(
+            "import os, time; print('done', flush=True);"
+            " os.close(1); time.sleep(0.2)"
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(lines, ["done"])
+
 
 if __name__ == "__main__":
     unittest.main()

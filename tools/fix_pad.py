@@ -29,7 +29,11 @@ path = sys.argv[1]
 print(f"Reading {path}...")
 
 reader = GGUFReader(path, "r")
-fixed_path = path.replace(".gguf", "_fixed.gguf")
+# Insert "_fixed" before the extension only; str.replace(".gguf", ...) would
+# also rewrite ".gguf" occurrences earlier in the path (directory names,
+# double extensions) and produce an output in the wrong location.
+_stem, _ext = os.path.splitext(path)
+fixed_path = _stem + "_fixed" + _ext
 
 # First pass: figure out whether any pad tokens are actually 1-D. If neither
 # is, the rewrite would be a no-op, and the round-trip itself is risky

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 """One-shot CLI for the full convert + fix_pad + llama-quantize pipeline.
 
 This is the headless counterpart to ``gguf_gui.py`` and shares the

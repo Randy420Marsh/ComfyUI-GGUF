@@ -1,3 +1,4 @@
+# (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 """Shared GGUF-conversion pipeline used by ``gguf_gui.py`` and the
 ``gguf_pipeline.py`` CLI.
 
@@ -167,6 +168,7 @@ DEFAULT_QUANT_TYPE = "Q4_K_M"
 KNOWN_ARCH_FIX_FILES = [
     "hyvid", "wan", "hunyuan", "flux", "sd3", "aura",
     "ltxv", "hidream", "cosmos", "lumina2", "ernie",
+    "sdxl", "sd1",
 ]
 
 
@@ -177,6 +179,19 @@ ARCHS_NEEDING_5D_REATTACH = ("hyvid", "wan")
 
 
 # ── Shell helpers ──────────────────────────────────────────────────────────
+
+def insert_name_suffix(filename: str, suffix: str) -> str:
+    """Insert ``suffix`` before the file extension.
+
+    ``insert_name_suffix("model.safetensors", "_5dfixed")`` ->
+    ``"model_5dfixed.safetensors"``.  Unlike ``str.replace`` this only
+    touches the final extension, so names that merely *contain*
+    ``.safetensors`` / ``.gguf`` elsewhere (or use a different extension
+    such as ``.sft``) still get a distinct output name.
+    """
+    stem, ext = os.path.splitext(filename)
+    return f"{stem}{suffix}{ext}"
+
 
 def shell_quote(path: str) -> str:
     """Quote a path for safe interpolation into a shell command string."""
@@ -218,7 +233,10 @@ def stream_command(cmd: str, env: dict, log: Callable[[str], None]) -> int:
     buffer = ""
     while True:
         char = process.stdout.read(1)
-        if not char and process.poll() is not None:
+        if not char:
+            # EOF on stdout: the child has closed its end. Reap it instead
+            # of spinning on poll() until it exits.
+            process.wait()
             break
         if char in ("\r", "\n"):
             cleaned = buffer.strip()
@@ -325,7 +343,7 @@ def preprocess_5d_tensors(src: str, temp_dir: str,
         log(f"    Folded  {key}  {list(tensor.shape)}  \u2192  {list(t.shape)}")
         fixed[key] = t
 
-    base = os.path.basename(src).replace(".safetensors", "_5dfixed.safetensors")
+    base = insert_name_suffix(os.path.basename(src), "_5dfixed")
     fixed_src = os.path.join(temp_dir, base)
     save_file(fixed, fixed_src)
     log(f"  Fixed source written: {fixed_src}")
@@ -434,9 +452,13 @@ def run_pipeline(
     filename = os.path.basename(src)
     f16_tmp = os.path.join(temp_dir, filename + "_f16.gguf")
     fixed_tmp = os.path.join(temp_dir, filename + "_f16_fixed.gguf")
+    # Use the stem only so sources with a different extension (.sft, .ckpt)
+    # still get a distinct "<stem>_<quant>.gguf" name -- a plain
+    # str.replace(".safetensors", ...) would no-op and could even overwrite
+    # the source when out_dir == dirname(src).
     final_out = os.path.join(
         out_dir,
-        filename.replace(".safetensors", f"_{quant_type}.gguf"),
+        f"{os.path.splitext(filename)[0]}_{quant_type}.gguf",
     )
 
     # ── Step 0 ─────────────────────────────────────────────────────────
@@ -530,7 +552,7 @@ def run_pipeline(
                 log(f"  Removed: {tmp}")
         fixed_src_path = os.path.join(
             temp_dir,
-            filename.replace(".safetensors", "_5dfixed.safetensors"),
+            insert_name_suffix(filename, "_5dfixed"),
         )
         if os.path.exists(fixed_src_path):
             os.remove(fixed_src_path)
