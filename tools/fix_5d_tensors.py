@@ -1,7 +1,6 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import os
 import gguf
-import torch
 import argparse
 from tqdm import tqdm
 from safetensors.torch import load_file

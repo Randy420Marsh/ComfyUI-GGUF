@@ -163,7 +163,7 @@ def inspect(path, verbose=False, metadata=False):
     print(f"Architecture: {arch}")
     print(f"File type:    {file_type}")
     print(f"Tensors:      {len(reader.tensors)}")
-    print(f"Dtype histogram:")
+    print("Dtype histogram:")
     for name in sorted(histogram, key=lambda k: (-histogram[k], k)):
         print(f"  {name:<10s}  {histogram[name]}")
 

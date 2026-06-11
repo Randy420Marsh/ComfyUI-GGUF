@@ -10,9 +10,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QComboBox, QDialog, QDialogButtonBox,
                                QTableWidget, QTableWidgetItem, QHeaderView,
                                QTextEdit, QMessageBox)
-from PySide6.QtCore import QThread, Signal, Slot, Qt
+from PySide6.QtCore import QThread, Signal, Slot
 from PySide6.QtGui import QColor, QFont
-from gguf import GGUFReader
 
 # analyze_model lives in the same tools/ directory; import it directly
 # rather than via tools.* so the GUI script remains runnable as a
@@ -20,7 +19,7 @@ from gguf import GGUFReader
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_TOOLS_DIR)
 sys.path.insert(0, _TOOLS_DIR)
-import analyze_model
+import analyze_model  # noqa: E402
 
 CONFIG_FILE = "settings.json"
 
@@ -28,11 +27,8 @@ CONFIG_FILE = "settings.json"
 # headless tools/gguf_pipeline.py CLI and this GUI share a single source of
 # truth.  Re-export the names the rest of the GUI module (combo boxes,
 # start_workflow's pre-flight check, settings.json defaults) already uses.
-from pipeline_lib import (
+from pipeline_lib import (  # noqa: E402
     locate_llama_quantize,
-    LLAMA_CPP_DIR,
-    LLAMA_QUANTIZE_BIN,
-    LLAMA_QUANTIZE_BIN_WIN,
     LLAMA_QUANTIZE_TYPES,
     DEFAULT_QUANT_TYPE,
     run_pipeline as _pipeline_run,
