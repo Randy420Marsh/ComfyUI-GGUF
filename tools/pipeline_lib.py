@@ -231,22 +231,25 @@ def stream_command(cmd: str, env: dict, log: Callable[[str], None]) -> int:
         text=True, bufsize=1,
     )
     buffer = ""
-    while True:
-        char = process.stdout.read(1)
-        if not char:
-            # EOF on stdout: the child has closed its end. Reap it instead
-            # of spinning on poll() until it exits.
-            process.wait()
-            break
-        if char in ("\r", "\n"):
-            cleaned = buffer.strip()
-            if cleaned:
-                log(cleaned)
-            buffer = ""
-        else:
-            buffer += char
-    if buffer.strip():
-        log(buffer.strip())
+    try:
+        while True:
+            char = process.stdout.read(1)
+            if not char:
+                # EOF on stdout: the child has closed its end. Reap it
+                # instead of spinning on poll() until it exits.
+                process.wait()
+                break
+            if char in ("\r", "\n"):
+                cleaned = buffer.strip()
+                if cleaned:
+                    log(cleaned)
+                buffer = ""
+            else:
+                buffer += char
+        if buffer.strip():
+            log(buffer.strip())
+    finally:
+        process.stdout.close()
     return process.returncode
 
 
