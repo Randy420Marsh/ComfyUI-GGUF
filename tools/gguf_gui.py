@@ -29,6 +29,9 @@ CONFIG_FILE = "settings.json"
 # start_workflow's pre-flight check, settings.json defaults) already uses.
 from pipeline_lib import (  # noqa: E402
     locate_llama_quantize,
+    detect_llm_src,
+    get_llama_cpp_latest_dir,
+    missing_latest_dir_error,
     LLAMA_QUANTIZE_TYPES,
     DEFAULT_QUANT_TYPE,
     run_pipeline as _pipeline_run,
@@ -368,6 +371,12 @@ class MainWindow(QMainWindow):
             self.input_field.setText(file_path)
             if not self.out_field.text().strip():
                 self.out_field.setText(os.path.dirname(file_path))
+        elif os.path.isdir(file_path):
+            # HF model folder (LLM text encoder) — the pipeline auto-routes
+            # these through convert_hf_to_gguf.py.
+            self.input_field.setText(file_path)
+            if not self.out_field.text().strip():
+                self.out_field.setText(os.path.dirname(file_path))
 
     # ── Preset persistence ────────────────────────────────────────────────────
 
@@ -462,19 +471,40 @@ class MainWindow(QMainWindow):
             self.log_area.appendPlainText(f"Error: source file not found:\n  {src}")
             return
 
-        # Pre-flight: confirm the patched llama-quantize exists before we
-        # spend 30+ seconds writing a 12+ GiB intermediate F16 GGUF only to
-        # fail at Step 3 because the build is missing.
-        _quant_bin, _quant_err = locate_llama_quantize()
-        if _quant_err:
-            self.log_area.clear()
+        # Pre-flight. Two routes with different requirements:
+        #  - LLM text encoders (HF folder / config.json sidecar) need an
+        #    up-to-date llama.cpp checkout (LLAMA_CPP_LATEST_DIR), NOT the
+        #    patched b3962 build.
+        #  - Diffusion models need the patched llama-quantize.
+        # Check the right one so we fail in seconds, not after a 12+ GiB
+        # intermediate write.
+        _llm_type = detect_llm_src(src)
+        if _llm_type is not None:
+            if get_llama_cpp_latest_dir() is None:
+                _err = missing_latest_dir_error(self.quant_combo.currentData())
+                self.log_area.clear()
+                self.log_area.appendPlainText(
+                    "=== Pre-flight check failed ===\n\n" + _err
+                )
+                QMessageBox.critical(
+                    self, "Latest llama.cpp checkout not configured", _err,
+                )
+                return
             self.log_area.appendPlainText(
-                "=== Pre-flight check failed ===\n\n" + _quant_err
+                f"LLM checkpoint detected (model_type={_llm_type!r}); "
+                f"using latest llama.cpp at {get_llama_cpp_latest_dir()}"
             )
-            QMessageBox.critical(
-                self, "llama-quantize not found", _quant_err,
-            )
-            return
+        else:
+            _quant_bin, _quant_err = locate_llama_quantize()
+            if _quant_err:
+                self.log_area.clear()
+                self.log_area.appendPlainText(
+                    "=== Pre-flight check failed ===\n\n" + _quant_err
+                )
+                QMessageBox.critical(
+                    self, "llama-quantize not found", _quant_err,
+                )
+                return
 
         self.log_area.clear()
         self.run_btn.setEnabled(False)

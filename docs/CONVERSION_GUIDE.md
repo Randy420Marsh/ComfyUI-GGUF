@@ -32,6 +32,7 @@ with `gguf`, `safetensors`, `torch`, `numpy`, `tqdm`, and optionally
    - [ERNIE-Image (+ Ministral-3-3B text encoder)](#ernie-image--ministral-3-3b-text-encoder)
    - [SD3 / SD3.5](#sd3--sd35)
    - [Hunyuan Video / Wan 2.1](#hunyuan-video--wan-21)
+   - [LLM text encoders — Gemma-3 (LTX 2.3), Qwen, T5, …](#llm-text-encoders--gemma-3-ltx-23-qwen-t5-)
 8. [Picking a quant: how the Analyze button decides](#picking-a-quant-how-the-analyze-button-decides)
 9. [Reference: quant types & bits-per-weight](#reference-quant-types--bits-per-weight)
 10. [Troubleshooting](#troubleshooting)
@@ -355,6 +356,41 @@ python tools/fix_5d_tensors.py \
 Once you've converted all your Hunyuan / Wan models for a given arch, delete the `tools/fix_5d_tensors_<arch>.safetensors` cache file.
 
 Recommended workflow: keep the unfixed intermediate quantized GGUF in a `raw/` subdir so you don't accidentally feed it into ComfyUI before running the fix.
+
+### LLM text encoders — Gemma-3 (LTX 2.3), Qwen, T5, …
+
+**These do not go through `convert.py` / the patched `llama-quantize` at all.** Feeding one to the diffusion pipeline fails with `AssertionError: Unknown model architecture!` — that error means "this is an LLM, use this recipe instead".
+
+The pipeline **autoroutes** LLM sources: whenever `--src` is a HuggingFace model *folder* (or a `.safetensors` next to a `config.json`), the GUI and `gguf_pipeline.py` hand it to `convert_hf_to_gguf.py` from an **up-to-date, unpatched** llama.cpp checkout. The pinned `b3962 + lcpp.patch` clone stays untouched — never update that one, it's what keeps Z-Image / Flux / Wan quantization working.
+
+One-time setup (see [`tools/README.md` § Text encoders](../tools/README.md#text-encoders-llm-models--the-optional-second-llamacpp) for details):
+
+```bash
+cd /path/to/ComfyUI-GGUF
+git clone https://github.com/ggml-org/llama.cpp llama.cpp-latest
+pip install sentencepiece
+# or, if you already keep a current llama.cpp elsewhere:
+#   export LLAMA_CPP_LATEST_DIR=/path/to/llama.cpp
+```
+
+Then:
+
+```bash
+# Gemma-3 12B (the LTX 2.3 text encoder) straight to Q8_0 — no separate
+# quantize step; convert_hf_to_gguf.py emits Q8_0/F16/BF16 directly:
+python tools/gguf_pipeline.py \
+  --src /models/gemma-3-12b \
+  --dst-dir /out/text_encoders/gemma-3-12b \
+  --quant Q8_0
+```
+
+Notes:
+
+- **Q8_0 is the right default** for text encoders. Measured on Gemma-3-12B: median KL-divergence vs the bf16 HF weights ≈ 0.0004, top-1 token agreement 98.4%, perplexity ratio 1.006. Since a text encoder's job is producing hidden states (no sampling), this is effectively lossless.
+- K/IQ quants (`Q4_K_M`, …) work too but additionally need `llama-quantize` built from the *latest* checkout (the pipeline tells you the exact cmake commands if it's missing). On Windows run cmake from the *x64 Native Tools Command Prompt* or after `vcvarsall.bat x64`.
+- Multimodal checkpoints (e.g. `Gemma3ForConditionalGeneration` with a vision tower) are fine — the converter extracts the text model, which is what the ComfyUI text-encoder node uses.
+- The output loads with `CLIPLoader (GGUF)`; `loader.py` supports `t5 / llama / mistral3 / qwen2vl / qwen3 / qwen3vl / gemma3 / gemma4`.
+- Finetunes of the same base model (identical `config.json` architecture + identical tokenizer) are drop-in swappable with each other in the loader node.
 
 ---
 

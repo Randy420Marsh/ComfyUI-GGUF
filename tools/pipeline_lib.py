@@ -28,6 +28,7 @@ Line endings: LF, like other tools/* importable Python modules
 to preserve its existing on-disk encoding.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -72,6 +73,34 @@ def _resolve_llama_cpp_dir() -> str:
     return os.path.abspath(os.path.join(os.getcwd(), "llama.cpp"))
 
 
+def get_llama_cpp_latest_dir() -> Optional[str]:
+    """Locate the *unpatched, up-to-date* llama.cpp checkout used for LLM
+    text-encoder conversion (``convert_hf_to_gguf.py``).
+
+    This is deliberately separate from :data:`LLAMA_CPP_DIR` (the pinned
+    ``b3962`` + ``lcpp.patch`` clone used for diffusion-model quantization):
+    the two serve different jobs and must never be merged — updating the
+    pinned clone breaks image-model quantization, and the pinned clone's
+    ``convert_hf_to_gguf.py`` is too old for modern LLM archs (e.g. Gemma-3).
+
+    Search order:
+      1. ``$LLAMA_CPP_LATEST_DIR`` (explicit override)
+      2. ``<repo_root>/llama.cpp-latest`` (documented optional layout)
+
+    Returns ``None`` when neither is configured — the LLM route is
+    optional and only needed when converting text-encoder models.
+    Resolved dynamically (not at import time) so the CLI flag /
+    environment changes take effect without re-importing.
+    """
+    override = os.environ.get("LLAMA_CPP_LATEST_DIR")
+    if override:
+        return os.path.abspath(override)
+    repo_local = os.path.join(_REPO_ROOT, "llama.cpp-latest")
+    if os.path.isdir(repo_local):
+        return repo_local
+    return None
+
+
 LLAMA_CPP_DIR = _resolve_llama_cpp_dir()
 LLAMA_QUANTIZE_BIN = os.path.join(
     LLAMA_CPP_DIR, "build", "bin", "llama-quantize"
@@ -114,6 +143,179 @@ def locate_llama_quantize() -> tuple[str, Optional[str]]:
         "  cmake --build build --config Release -j --target llama-quantize\n"
     )
     return expected, err
+
+
+# ── LLM text-encoder route (optional, needs an up-to-date llama.cpp) ──────
+
+# Output types convert_hf_to_gguf.py can emit directly (no llama-quantize
+# pass needed).  Maps pipeline quant names -> --outtype values.
+HF_DIRECT_OUTTYPES = {
+    "F32": "f32",
+    "F16": "f16",
+    "BF16": "bf16",
+    "Q8_0": "q8_0",
+    "TQ1_0": "tq1_0",
+    "TQ2_0": "tq2_0",
+}
+
+
+def detect_llm_src(src: str) -> Optional[str]:
+    """Return the HF ``model_type`` when ``src`` is an LLM checkpoint,
+    else ``None``.
+
+    An LLM checkpoint is either a HuggingFace model *directory* (contains
+    ``config.json`` with a ``model_type``) or a ``.safetensors`` file whose
+    parent directory has such a ``config.json``.  Diffusion checkpoints
+    handled by ``convert.py`` are standalone ComfyUI-style files without
+    an HF config sidecar, so this heuristic cleanly separates the routes.
+    """
+    if os.path.isdir(src):
+        cfg_path = os.path.join(src, "config.json")
+    elif os.path.isfile(src):
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(src)), "config.json")
+    else:
+        return None
+    if not os.path.isfile(cfg_path):
+        return None
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    model_type = cfg.get("model_type")
+    if isinstance(model_type, str) and model_type:
+        return model_type
+    return None
+
+
+def missing_latest_dir_error(quant_type: str) -> str:
+    return (
+        "This source is an LLM text-encoder checkpoint (HuggingFace layout "
+        "with config.json), which the diffusion converter cannot handle.\n"
+        "Converting it needs an *up-to-date* llama.cpp checkout (do NOT "
+        "update the pinned b3962+lcpp.patch clone — that one is only for "
+        "diffusion models and must stay pinned).\n\n"
+        "Set it up once:\n"
+        "  git clone https://github.com/ggml-org/llama.cpp llama.cpp-latest\n"
+        "(from the ComfyUI-GGUF repo root), or point the pipeline at an "
+        "existing checkout:\n"
+        "  set LLAMA_CPP_LATEST_DIR=C:\\path\\to\\llama.cpp   (Windows)\n"
+        "  export LLAMA_CPP_LATEST_DIR=/path/to/llama.cpp   (Linux/macOS)\n"
+        "or pass --llama-cpp-latest-dir to gguf_pipeline.py.\n\n"
+        f"(Requested quant: {quant_type}. F32/F16/BF16/Q8_0 need only the "
+        "checkout; K/IQ quants additionally need its llama-quantize built.)"
+    )
+
+
+def locate_llama_quantize_latest(latest_dir: str) -> tuple[str, Optional[str]]:
+    """Return ``(bin_path, error_or_None)`` for the *latest* checkout's
+    (unpatched) llama-quantize.  Same lookup shape as
+    :func:`locate_llama_quantize` but rooted at ``latest_dir``.
+    """
+    win = os.path.join(latest_dir, "build", "bin", "Release", "llama-quantize.exe")
+    posix = os.path.join(latest_dir, "build", "bin", "llama-quantize")
+    if os.name == "nt" and os.path.exists(win):
+        return win, None
+    if os.path.exists(posix):
+        return posix, None
+    expected = win if os.name == "nt" else posix
+    err = (
+        f"llama-quantize not found at {expected}.\n"
+        f"The selected quant needs the latest checkout's quantizer built:\n"
+        f"  cd {latest_dir}\n"
+        "  cmake -B build -DCMAKE_BUILD_TYPE=Release\n"
+        "  cmake --build build --config Release -j --target llama-quantize\n"
+        "Alternatively pick Q8_0 / F16 / BF16, which convert_hf_to_gguf.py "
+        "emits directly without llama-quantize."
+    )
+    return expected, err
+
+
+def run_llm_pipeline(
+    src: str,
+    temp_dir: str,
+    out_dir: str,
+    quant_type: str = "Q8_0",
+    log: Callable[[str], None] = print,
+    cleanup: bool = True,
+    model_type: str = "",
+) -> str:
+    """Convert an LLM text-encoder checkpoint (HF folder) to a quantized
+    GGUF using the *latest* llama.cpp's ``convert_hf_to_gguf.py``.
+
+    For quants in :data:`HF_DIRECT_OUTTYPES` this is a single conversion
+    step.  For K/IQ quants the pipeline converts to an intermediate
+    (source-dtype) GGUF first and then runs the latest checkout's
+    ``llama-quantize`` on it.
+
+    Returns the absolute path of the final ``.gguf``; raises
+    ``RuntimeError`` with setup instructions when no up-to-date llama.cpp
+    checkout is configured (see :func:`get_llama_cpp_latest_dir`).
+    """
+    latest_dir = get_llama_cpp_latest_dir()
+    if not latest_dir or not os.path.isdir(latest_dir):
+        raise RuntimeError(missing_latest_dir_error(quant_type))
+    convert_hf = os.path.join(latest_dir, "convert_hf_to_gguf.py")
+    if not os.path.isfile(convert_hf):
+        raise RuntimeError(
+            f"convert_hf_to_gguf.py not found in {latest_dir!r}.\n"
+            "LLAMA_CPP_LATEST_DIR must point at a llama.cpp source checkout "
+            "(not just a binary release)."
+        )
+
+    hf_dir = src if os.path.isdir(src) else os.path.dirname(os.path.abspath(src))
+    name = os.path.basename(os.path.normpath(hf_dir))
+    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+    final_out = os.path.join(out_dir, f"{name}-{quant_type}.gguf")
+    env = os.environ.copy()
+
+    log(f"=== LLM route: {model_type or 'HF checkpoint'} via latest llama.cpp ===")
+    log(f"  Checkout: {latest_dir}")
+    log(f"  Source:   {hf_dir}")
+
+    direct = HF_DIRECT_OUTTYPES.get(quant_type)
+    if direct is not None:
+        log(f"\n=== Step 1: convert_hf_to_gguf.py --outtype {direct} ===")
+        cmd = (
+            f"{shell_quote(sys.executable)} {shell_quote(convert_hf)} "
+            f"{shell_quote(hf_dir)} --outfile {shell_quote(final_out)} "
+            f"--outtype {direct}"
+        )
+        if stream_command(cmd, env, log) != 0:
+            raise RuntimeError("convert_hf_to_gguf.py failed. See log above.")
+    else:
+        # Two-step: full-precision intermediate, then unpatched llama-quantize.
+        quantize_bin, quantize_err = locate_llama_quantize_latest(latest_dir)
+        if quantize_err:
+            raise RuntimeError(quantize_err)
+        inter = os.path.join(temp_dir, f"{name}-convert_hf_auto.gguf")
+        log("\n=== Step 1: convert_hf_to_gguf.py --outtype auto (intermediate) ===")
+        cmd = (
+            f"{shell_quote(sys.executable)} {shell_quote(convert_hf)} "
+            f"{shell_quote(hf_dir)} --outfile {shell_quote(inter)} "
+            f"--outtype auto"
+        )
+        if stream_command(cmd, env, log) != 0:
+            raise RuntimeError("convert_hf_to_gguf.py failed. See log above.")
+        log(f"\n=== Step 2: llama-quantize (latest) -> {quant_type} ===")
+        cmd = (
+            f"{shell_quote(quantize_bin)} "
+            f"{shell_quote(inter)} {shell_quote(final_out)} {quant_type}"
+        )
+        rc = stream_command(cmd, env, log)
+        if cleanup and os.path.exists(inter):
+            os.remove(inter)
+            log(f"  Removed intermediate: {inter}")
+        if rc != 0:
+            raise RuntimeError("llama-quantize (latest) failed. See log above.")
+
+    try:
+        reader = GGUFReader(final_out)
+        log(f"\n✓ Output verified: {len(reader.tensors)} tensors written successfully.")
+    except Exception as exc:
+        log(f"\n⚠ Output verification warning: {exc}")
+    return final_out
 
 
 # ── Quantization output types (verbatim from llama-quantize @ b3962) ──────
@@ -441,6 +643,27 @@ def run_pipeline(
             f"Unknown quant type {quant_type!r}; "
             f"must be one of {QUANTIZE_TYPE_NAMES}"
         )
+
+    # ── LLM autoroute ──────────────────────────────────────────────────
+    # HF-layout checkpoints (config.json sidecar / model directory) are
+    # LLM text encoders — convert.py's diffusion arch detection would
+    # only die with "Unknown model architecture!".  Route them through
+    # the latest-llama.cpp path instead.  Diffusion sources are
+    # standalone .safetensors without an HF config and fall through
+    # unchanged.
+    llm_type = detect_llm_src(src)
+    if llm_type is not None:
+        log(f"Detected HF LLM checkpoint (model_type={llm_type!r}) — "
+            f"routing to convert_hf_to_gguf.py.")
+        if dtype_cli != "auto":
+            log(f"  (--dtype {dtype_cli} does not apply to the LLM route; "
+                f"convert_hf_to_gguf.py picks the output dtype.)")
+        return run_llm_pipeline(
+            src=src, temp_dir=temp_dir, out_dir=out_dir,
+            quant_type=quant_type, log=log, cleanup=cleanup,
+            model_type=llm_type,
+        )
+
     if not os.path.isfile(src):
         raise FileNotFoundError(f"Source not found: {src}")
     os.makedirs(temp_dir, exist_ok=True)

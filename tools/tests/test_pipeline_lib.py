@@ -48,7 +48,8 @@ class LocateLlamaQuantizeTests(unittest.TestCase):
             with mock.patch.object(pipeline_lib.os.path, "exists", return_value=False):
                 # Re-resolve under the override.
                 resolved = pipeline_lib._resolve_llama_cpp_dir()
-            self.assertEqual(resolved, "/nonexistent/path")
+            # abspath() so the assertion holds on Windows too (drive prefix).
+            self.assertEqual(resolved, os.path.abspath("/nonexistent/path"))
 
     def test_found_binary_returns_no_error(self):
         with mock.patch.object(pipeline_lib.os.path, "exists", return_value=True):
@@ -281,6 +282,125 @@ class InsertNameSuffixTests(unittest.TestCase):
             pipeline_lib.insert_name_suffix("model", "_5dfixed"),
             "model_5dfixed",
         )
+
+
+class DetectLlmSrcTests(unittest.TestCase):
+    """HF-checkpoint detection driving the LLM autoroute."""
+
+    @staticmethod
+    def _write_config(dirpath: str, payload: dict) -> None:
+        import json
+        with open(os.path.join(dirpath, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def test_hf_directory_with_model_type(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write_config(td, {"model_type": "gemma3"})
+            self.assertEqual(pipeline_lib.detect_llm_src(td), "gemma3")
+
+    def test_safetensors_with_config_sidecar(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write_config(td, {"model_type": "t5"})
+            st = os.path.join(td, "model.safetensors")
+            open(st, "wb").close()
+            self.assertEqual(pipeline_lib.detect_llm_src(st), "t5")
+
+    def test_standalone_safetensors_is_not_llm(self):
+        with tempfile.TemporaryDirectory() as td:
+            st = os.path.join(td, "flux-dev.safetensors")
+            open(st, "wb").close()
+            self.assertIsNone(pipeline_lib.detect_llm_src(st))
+
+    def test_config_without_model_type_is_not_llm(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write_config(td, {"some_other_key": 1})
+            self.assertIsNone(pipeline_lib.detect_llm_src(td))
+
+    def test_corrupt_config_is_not_llm(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "config.json"), "w") as f:
+                f.write("{not json")
+            self.assertIsNone(pipeline_lib.detect_llm_src(td))
+
+    def test_nonexistent_path(self):
+        self.assertIsNone(pipeline_lib.detect_llm_src("/nonexistent/model"))
+
+
+class LatestLlamaCppDirTests(unittest.TestCase):
+    """Resolution of the optional up-to-date llama.cpp checkout."""
+
+    def test_env_override_wins(self):
+        with mock.patch.dict(os.environ, {"LLAMA_CPP_LATEST_DIR": "/opt/llama.cpp"}):
+            self.assertEqual(
+                pipeline_lib.get_llama_cpp_latest_dir(),
+                os.path.abspath("/opt/llama.cpp"),
+            )
+
+    def test_unconfigured_returns_none(self):
+        env = {k: v for k, v in os.environ.items() if k != "LLAMA_CPP_LATEST_DIR"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(pipeline_lib.os.path, "isdir", return_value=False):
+                self.assertIsNone(pipeline_lib.get_llama_cpp_latest_dir())
+
+    def test_repo_local_fallback(self):
+        env = {k: v for k, v in os.environ.items() if k != "LLAMA_CPP_LATEST_DIR"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(pipeline_lib.os.path, "isdir", return_value=True):
+                resolved = pipeline_lib.get_llama_cpp_latest_dir()
+        self.assertIsNotNone(resolved)
+        self.assertTrue(resolved.endswith("llama.cpp-latest"))
+
+
+class LlmRouteTests(unittest.TestCase):
+    """run_pipeline must route HF checkpoints away from convert.py."""
+
+    def test_hf_dir_without_latest_checkout_raises_with_guidance(self):
+        env = {k: v for k, v in os.environ.items() if k != "LLAMA_CPP_LATEST_DIR"}
+        with tempfile.TemporaryDirectory() as td:
+            hf = os.path.join(td, "gemma-3-12b")
+            os.makedirs(hf)
+            DetectLlmSrcTests._write_config(hf, {"model_type": "gemma3"})
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch.object(
+                    pipeline_lib, "get_llama_cpp_latest_dir", return_value=None
+                ):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        pipeline_lib.run_pipeline(
+                            src=hf,
+                            temp_dir=os.path.join(td, "tmp"),
+                            out_dir=os.path.join(td, "out"),
+                            quant_type="Q8_0",
+                            log=lambda _m: None,
+                        )
+        msg = str(ctx.exception)
+        self.assertIn("LLAMA_CPP_LATEST_DIR", msg)
+        self.assertIn("lcpp.patch", msg)  # must warn against updating the pinned clone
+
+    def test_direct_outtypes_are_valid_quant_names(self):
+        for name in pipeline_lib.HF_DIRECT_OUTTYPES:
+            self.assertIn(name, pipeline_lib.QUANTIZE_TYPE_NAMES)
+
+    def test_latest_quantize_locator_reports_missing_build(self):
+        with tempfile.TemporaryDirectory() as td:
+            path, err = pipeline_lib.locate_llama_quantize_latest(td)
+        self.assertIsNotNone(err)
+        self.assertIn("llama-quantize", err)
+        self.assertIn("Q8_0", err)  # must mention the no-build escape hatch
+
+
+class CliLatestDirFlagTests(unittest.TestCase):
+    """--llama-cpp-latest-dir plumbing."""
+
+    def test_flag_parses(self):
+        ns = gguf_pipeline.parse_args(
+            ["--src", "x", "--dst-dir", "/o",
+             "--llama-cpp-latest-dir", "/opt/llama.cpp"]
+        )
+        self.assertEqual(ns.llama_cpp_latest_dir, "/opt/llama.cpp")
+
+    def test_flag_defaults_to_none(self):
+        ns = gguf_pipeline.parse_args(["--src", "x", "--dst-dir", "/o"])
+        self.assertIsNone(ns.llama_cpp_latest_dir)
 
 
 class StreamCommandTests(unittest.TestCase):

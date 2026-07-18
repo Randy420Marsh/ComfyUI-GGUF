@@ -3,7 +3,10 @@
 This directory contains the standalone Python tools used to convert
 diffusion-model `.safetensors` checkpoints into the GGUF format that the
 ComfyUI-GGUF custom node loads, plus the patched `llama-quantize` build
-recipe used to compress them further.
+recipe used to compress them further. LLM **text encoders** (Gemma-3,
+Qwen, T5, …) are a different beast — the pipeline autoroutes those through
+an optional second, up-to-date llama.cpp checkout; see
+[Text encoders (LLM models)](#text-encoders-llm-models--the-optional-second-llamacpp).
 
 The tools here are **separate** from the inference-time custom node: they
 have their own dependencies (see [`requirements-conversion.txt`](requirements-conversion.txt))
@@ -388,6 +391,86 @@ Prints arch + file type + per-tensor dtype histogram. Useful flags:
 
 ---
 
+## Text encoders (LLM models) — the optional second llama.cpp
+
+The pinned `b3962 + lcpp.patch` clone above exists **only** to quantize
+diffusion models. It must stay pinned — updating it breaks the image-model
+quant math, and the patch doesn't apply to newer tags. But its bundled
+`convert_hf_to_gguf.py` is also ancient, so it can't convert modern **LLM
+text encoders** (Gemma-3 for LTX 2.3, Qwen3, Mistral-3, …).
+
+Those need a **second, up-to-date, unpatched** llama.cpp checkout. The two
+live side by side and never conflict:
+
+| | Diffusion models | LLM text encoders |
+|---|---|---|
+| Input | standalone `.safetensors` (UNET / DiT) | HuggingFace folder with `config.json` |
+| Converter | `tools/convert.py` | `convert_hf_to_gguf.py` (latest llama.cpp) |
+| Quantizer | patched `llama-quantize` (b3962) | none needed for Q8_0/F16/BF16; latest `llama-quantize` for K/IQ quants |
+| llama.cpp checkout | `<repo>/llama.cpp` — **frozen** | `<repo>/llama.cpp-latest` or `$LLAMA_CPP_LATEST_DIR` — **update freely** |
+
+### Setup (once)
+
+```bash
+cd /path/to/ComfyUI-GGUF        # repo root
+git clone https://github.com/ggml-org/llama.cpp llama.cpp-latest
+pip install sentencepiece       # into the conversion venv, for SP-tokenizer models (Gemma, T5)
+```
+
+No build step is needed for Q8_0 / F16 / BF16 output — `convert_hf_to_gguf.py`
+emits those directly and uses the checkout's own bundled `gguf-py`. Only if
+you want K/IQ quants of an LLM do you also build its (unpatched) quantizer:
+`cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release -j --target llama-quantize`.
+
+> **Windows:** run the cmake commands from the *x64 Native Tools Command
+> Prompt for VS 2022* (or initialise MSVC in a plain terminal first with
+> `"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64`),
+> otherwise CMake won't find the compiler. Same requirement as the patched
+> build in [Platform notes](#platform-notes).
+
+If your up-to-date checkout lives elsewhere (e.g. you already have one for
+running LLMs), point the tools at it instead of cloning again:
+
+```bash
+export LLAMA_CPP_LATEST_DIR=/path/to/llama.cpp    # Linux/macOS
+set LLAMA_CPP_LATEST_DIR=C:\AI\llama.cpp          :: Windows
+```
+
+or per-invocation: `python tools/gguf_pipeline.py ... --llama-cpp-latest-dir /path/to/llama.cpp`.
+
+### Usage — it autoroutes
+
+Both the GUI and `gguf_pipeline.py` detect LLM inputs automatically: a
+source that is a HF model **folder**, or a `.safetensors` with a
+`config.json` sidecar next to it, is routed through `convert_hf_to_gguf.py`
+instead of `convert.py`. Diffusion sources (standalone `.safetensors`, no
+HF config) take the classic patched path, unchanged.
+
+```bash
+# Gemma-3 12B text encoder (LTX 2.3) straight to Q8_0:
+python tools/gguf_pipeline.py \
+  --src /models/gemma-3-12b \
+  --dst-dir /out/text_encoders/gemma-3-12b \
+  --quant Q8_0
+```
+
+In the GUI, just point **Input Model** at the HF folder (drag-and-drop a
+folder works) or at the `model.safetensors` inside it; the log will show
+`LLM checkpoint detected (model_type=...)` and the pre-flight will check
+the latest checkout instead of the patched quantizer.
+
+The output is a standard llama.cpp GGUF (`general.architecture = gemma3`
+etc.), which is exactly what the ComfyUI-GGUF `CLIPLoader (GGUF)` node
+expects for text encoders — `loader.py` supports `t5 / llama / mistral3 /
+qwen2vl / qwen3 / qwen3vl / gemma3 / gemma4`.
+
+> Q8_0 quality note: measured on Gemma-3-12B, Q8_0 matches the bf16 HF
+> weights to within a median KL-divergence of 0.0004 and picks the same
+> top-1 token 98.4% of the time — for text-encoder use (hidden states, not
+> sampling) it is effectively lossless.
+
+---
+
 ## Platform notes
 
 ### Windows + Visual Studio 2019
@@ -399,6 +482,12 @@ cmake --build build --config Release -j10 --target llama-quantize
 ```
 
 ### Windows + Visual Studio 2022
+
+Run the commands below from the **x64 Native Tools Command Prompt for VS 2022**, or initialise MSVC in a regular terminal first:
+
+```bat
+"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+```
 
 VS2022's MSVC defaults to C++14, which doesn't compile modern CUDA/llama.cpp. Force C++17 explicitly:
 
@@ -446,6 +535,7 @@ export DYLD_LIBRARY_PATH=./llama.cpp/build/src:./llama.cpp/build/ggml/src:$DYLD_
 - **GUI says "GPU not detected"**: `nvidia-smi` isn't on PATH (CPU-only / ROCm / Apple machine). The GUI still works — Analyze just disables the Fits / recommendation columns. Use `Force F16` as the dtype mode.
 - **bf16 model is huge and slow on RTX 20xx**: bf16 weights get up-cast to fp32 at runtime on Turing because it has no native bf16 support. Re-convert with `--dtype fp16` (CLI) or `Auto`/`Force F16` (GUI) to produce an F16 GGUF instead.
 - **`Unexpected text model architecture type in GGUF file: 'mistral3'`**: you're on an older `loader.py` than what this repo currently ships. Pull the latest `main` — `mistral3` (Ministral 3B / ERNIE-Image text encoder) is supported.
+- **`AssertionError: Unknown model architecture!` from `convert.py`**: your source is an LLM text encoder (Gemma-3, Qwen, T5, …), not a diffusion model. `convert.py` only handles the 13 diffusion archs. Use the [LLM text-encoder route](#text-encoders-llm-models--the-optional-second-llamacpp) — with a current pipeline it autoroutes whenever a `config.json` sits next to the source; you just need the up-to-date second llama.cpp checkout configured.
 
 ---
 

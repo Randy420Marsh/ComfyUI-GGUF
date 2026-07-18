@@ -31,6 +31,15 @@ Custom temp dir + keep the intermediates for inspection::
         --dst-dir /out \\
         --temp-dir /scratch \\
         --keep-intermediate
+
+LLM text encoder (HF folder with config.json, e.g. Gemma-3) — auto-routed
+to the *latest* llama.cpp's convert_hf_to_gguf.py instead of convert.py::
+
+    python tools/gguf_pipeline.py \\
+        --src /models/gemma-3-12b \\
+        --dst-dir /out \\
+        --quant Q8_0 \\
+        --llama-cpp-latest-dir /path/to/current/llama.cpp
 """
 
 import argparse
@@ -67,7 +76,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--src", required=True,
-        help="Source .safetensors file to convert.",
+        help="Source .safetensors file to convert (diffusion models), or a "
+             "HuggingFace model folder / .safetensors with a config.json "
+             "sidecar (LLM text encoders; auto-routed to "
+             "convert_hf_to_gguf.py from the latest llama.cpp checkout).",
     )
     parser.add_argument(
         "--dst-dir", required=True,
@@ -107,11 +119,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "in Step 0 already covers HyVid / Wan, so this is normally a no-op."
         ),
     )
+    parser.add_argument(
+        "--llama-cpp-latest-dir", default=None, metavar="DIR",
+        help=(
+            "Path to an up-to-date llama.cpp source checkout, used only for "
+            "the LLM text-encoder route (HF folders). Overrides the "
+            "LLAMA_CPP_LATEST_DIR environment variable and the default "
+            "<repo>/llama.cpp-latest location. This is separate from the "
+            "pinned b3962+lcpp.patch clone used for diffusion models."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.llama_cpp_latest_dir:
+        # pipeline_lib resolves this dynamically per call, so setting the
+        # env var here is enough for the LLM autoroute to pick it up.
+        os.environ["LLAMA_CPP_LATEST_DIR"] = args.llama_cpp_latest_dir
     temp_dir = args.temp_dir or os.path.join(args.dst_dir, "temp")
     try:
         final_out = pipeline_lib.run_pipeline(
