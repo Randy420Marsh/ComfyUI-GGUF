@@ -33,6 +33,7 @@ with `gguf`, `safetensors`, `torch`, `numpy`, `tqdm`, and optionally
    - [SD3 / SD3.5](#sd3--sd35)
    - [Hunyuan Video / Wan 2.1](#hunyuan-video--wan-21)
    - [LLM text encoders — Gemma-3 (LTX 2.3), Qwen, T5, …](#llm-text-encoders--gemma-3-ltx-23-qwen-t5-)
+     - [LTX 2.3: the Gemma GGUF alone is not enough](#ltx-23-the-gemma-gguf-alone-is-not-enough)
 8. [Picking a quant: how the Analyze button decides](#picking-a-quant-how-the-analyze-button-decides)
 9. [Reference: quant types & bits-per-weight](#reference-quant-types--bits-per-weight)
 10. [Troubleshooting](#troubleshooting)
@@ -391,6 +392,45 @@ Notes:
 - Multimodal checkpoints (e.g. `Gemma3ForConditionalGeneration` with a vision tower) are fine — the converter extracts the text model, which is what the ComfyUI text-encoder node uses.
 - The output loads with `CLIPLoader (GGUF)`; `loader.py` supports `t5 / llama / mistral3 / qwen2vl / qwen3 / qwen3vl / gemma3 / gemma4`.
 - Finetunes of the same base model (identical `config.json` architecture + identical tokenizer) are drop-in swappable with each other in the loader node.
+
+#### LTX 2.3: the Gemma GGUF alone is not enough
+
+The LTX-2 / LTX-2.3 text encoder is Gemma-3-12B **plus** a `text_embedding_projection`
+layer (LTX 2.3: "dual_linear", 3840×49 → 4096 video + 2048 audio) that flattens the
+stacked hidden states of all 49 Gemma layers into the 3D embedding the LTXAV
+connectors expect. That projection is not a Gemma tensor, so `convert_hf_to_gguf.py`
+drops it — it isn't in the GGUF, and it isn't in the Comfy-Org
+`gemma_3_12B_it_fp4_mixed.safetensors` text-encoder file either. It only ships
+embedded in the full Lightricks checkpoints, as top-level
+`text_embedding_projection.*` keys next to `model.diffusion_model.*` (the stock
+ComfyUI LTX-2.3 template quietly builds its CLIP from the gemma file **plus the
+checkpoint**, which is where it gets the projection from).
+
+Symptom of loading the Gemma GGUF alone with `CLIPLoader (GGUF)`: ComfyUI ignores
+the selected clip type for a single Gemma file (`comfy/sd.py` routes by tensor
+detection to the bare `gemma3_te`), the encoder emits raw 4D all-layer hidden
+states, and sampling crashes with
+`RuntimeError: Tensors must have same number of dimensions: got 4 and 3`
+inside `embeddings_connector.py`.
+
+Fix — extract the projection once from any LTX checkpoint you have (dev-fp8 and
+distilled-1.1 carry identical weights):
+
+```bash
+python tools/extract_ltx_projection.py \
+  --src /models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors \
+  --dst /models/text_encoders/ltx-2.3-text_embedding_projection.safetensors
+```
+
+then load with **`DualCLIPLoader (GGUF)`**, type `ltxv`:
+
+| slot | file | note |
+|------|------|------|
+| clip_name1 | `gemma-3-12b-*.gguf` | must be slot 1 — the tokenizer sidecar is read from the first file |
+| clip_name2 | `ltx-2.3-text_embedding_projection.safetensors` | ~2.3 GB, bf16 |
+
+With two files ComfyUI takes the `CLIPType.LTXV` dual path, `sd_detect` finds the
+projection, and it builds the full `LTXAVTEModel` instead of the bare Gemma encoder.
 
 ---
 
